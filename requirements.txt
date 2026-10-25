@@ -1,0 +1,9 @@
+yfinance>=0.2.40
+mplfinance>=0.12.10b0
+google-genai>=1.0.0
+pandas>=2.0.0
+numpy>=1.24.0
+Pillow>=10.0.0
+matplotlib>=3.8.0
+python-dotenv>=1.0.0
+schedule>=1.2.2

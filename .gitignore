@@ -1,0 +1,8 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+agent_state.json
+temp_macro.png
+temp_micro.png
