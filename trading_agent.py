@@ -26,6 +26,7 @@ import mplfinance as mpf
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from PIL import Image
@@ -553,6 +554,7 @@ def compute_metrics(df_4h: pd.DataFrame, df_15m: pd.DataFrame) -> dict[str, Any]
 
 
 def get_genai_client() -> genai.Client:
+    load_dotenv()
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError(
