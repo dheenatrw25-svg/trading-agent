@@ -8,6 +8,27 @@
 - `templates/` — dashboard HTML
 - `tests/` — automated tests
 
+## Forecast records and evaluation
+
+- The 2-hour BTC predictor writes only to `logs/btc_forecasts_2h.csv`.
+- Dashboard and scheduled advisory predictions write only to `logs/advisory_log.csv`.
+- The prior CSV files are migration inputs. Before migration, they are copied to
+  `logs/backups/*.pre-phase1.bak`; the original files are left untouched.
+- Old 2-hour BTC forecasts without verifiable UTC timestamps and source-candle data
+  are marked `NEEDS_REVIEW`, not assigned a guessed result. Malformed or
+  market-shaped rows in an old shared advisory file are left in the original and
+  its backup, rather than misclassified as dashboard predictions.
+- Pending BTC forecasts are evaluated after their intended two-hour expiry. The
+  evaluator records direction correctness, final-close range coverage, full-period
+  range coverage, and projected-price errors as separate measurements. For
+  `SIDEWAYS`, direction correctness is not applicable; the two range measurements
+  are used instead.
+- Evaluation prefers a 15-minute close at the exact expiry boundary. When expiry
+  falls between 15-minute closes, it uses the latest completed 1-minute close no
+  more than one minute before expiry. Range measurements use complete OHLC candle
+  bars overlapping the evaluated interval, and the actual close timestamp is
+  recorded so the candle resolution is visible.
+
 ## Run
 
 Run commands from the repository root:
@@ -17,5 +38,5 @@ python -m uvicorn src.app:app --reload
 python -m src.auto_run
 python -m src.market_predictor
 python -m src.trading_agent
-python -m unittest discover -s tests
+python -m unittest discover -s tests -v
 ```

@@ -9,10 +9,10 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from . import chart_engine, data_engine, pro_strategist
 from .paths import ASSETS_DIR, PROJECT_ROOT
 from .prediction_logs import (
-    APP_LOG_FIELDS,
-    APP_LOG_FILE,
+    ADVISORY_LOG_FIELDS,
+    ADVISORY_LOG_FILE,
     append_record,
-    initialize_app_log,
+    initialize_advisory_log,
     to_utc_iso,
     utc_now,
 )
@@ -20,7 +20,7 @@ from .prediction_logs import (
 
 INDEX_FILE = PROJECT_ROOT / "templates" / "index.html"
 CHART_FILE = ASSETS_DIR / "prediction_chart.png"
-HISTORY_FILE = APP_LOG_FILE
+HISTORY_FILE = ADVISORY_LOG_FILE
 FORECAST_HORIZON_HOURS = 4
 ANALYSIS_LOCK = Lock()
 
@@ -63,8 +63,8 @@ def log_prediction(
         "market_regime": decision_json.get("market_regime", ""),
         "reasoning": decision_json.get("reasoning", ""),
     }
-    initialize_app_log()
-    append_record(HISTORY_FILE, APP_LOG_FIELDS, row)
+    initialize_advisory_log(HISTORY_FILE)
+    append_record(HISTORY_FILE, ADVISORY_LOG_FIELDS, row)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -179,7 +179,7 @@ def _history_record(row: dict[str, Any]) -> dict[str, Any]:
 def get_history() -> list[dict[str, Any]] | JSONResponse:
     try:
         if not HISTORY_FILE.is_file():
-            initialize_app_log()
+            initialize_advisory_log(HISTORY_FILE)
         history = pd.read_csv(HISTORY_FILE)
         if "timestamp" not in history.columns:
             return JSONResponse(

@@ -11,9 +11,9 @@ from PIL import Image
 
 from . import chart_engine, data_engine
 from .evaluator import retrieve_past_lessons
-from .paths import ASSETS_DIR
+from .paths import ASSETS_DIR, PROJECT_ROOT
 
-load_dotenv()
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 
 PRO_TRADER_PROMPT = """You are an elite institutional quantitative cryptocurrency analyst. Your objective is to provide highly accurate, probabilistic market forecasts with strict risk management.
 You have two inputs:

@@ -4,24 +4,24 @@ from pathlib import Path
 
 import schedule
 
-from . import chart_engine, data_engine, market_predictor, pro_strategist
+from . import chart_engine, data_engine, evaluator, market_predictor, pro_strategist
 from .prediction_logs import (
-    APP_LOG_FIELDS,
-    APP_LOG_FILE,
+    ADVISORY_LOG_FIELDS,
+    ADVISORY_LOG_FILE,
     append_record,
-    initialize_app_log,
+    initialize_advisory_log,
     to_utc_iso,
     utc_now,
 )
 
 
-CSV_FILENAME = str(APP_LOG_FILE)
-CSV_HEADERS = APP_LOG_FIELDS
+CSV_FILENAME = str(ADVISORY_LOG_FILE)
+CSV_HEADERS = ADVISORY_LOG_FIELDS
 FORECAST_HORIZON_HOURS = 4
 
 
 def initialize_csv(filename: str = CSV_FILENAME) -> None:
-    initialize_app_log(Path(filename))
+    initialize_advisory_log(Path(filename))
 
 
 def _validate_advisory(advisory: object) -> bool:
@@ -81,7 +81,7 @@ def run_agent_pipeline() -> None:
             "market_regime": advisory["market_regime"],
             "reasoning": advisory["reasoning"],
         }
-        append_record(APP_LOG_FILE, APP_LOG_FIELDS, row)
+        append_record(ADVISORY_LOG_FILE, ADVISORY_LOG_FIELDS, row)
         print(f"[GATEKEEPER] Advisory logged to {CSV_FILENAME}.")
     except Exception as exc:
         print(f"[GATEKEEPER] Pipeline failed: {exc}")
@@ -96,6 +96,15 @@ def run_market_prediction() -> None:
         market_predictor.run_predictor("BTC-USD")
     except Exception as exc:
         print(f"Error during prediction: {exc}")
+    try:
+        result = evaluator.grade_pending_predictions()
+        print(
+            "[EVALUATOR] "
+            f"{result['graded']} evaluated, {result['pending']} pending, "
+            f"{result['needs_review']} need review, {result['errors']} errors."
+        )
+    except Exception as exc:
+        print(f"Error during forecast evaluation: {exc}")
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ import json
 import datetime
 import math
 import tempfile
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -12,19 +13,19 @@ from PIL import Image
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
-from .paths import ASSETS_DIR
+from .paths import ASSETS_DIR, PROJECT_ROOT
 from .prediction_logs import (
-    MARKET_LOG_FIELDS,
-    MARKET_LOG_FILE,
+    BTC_FORECAST_FIELDS,
+    BTC_FORECAST_FILE,
     append_record,
-    initialize_market_log,
+    initialize_btc_forecast_log,
     to_utc_iso,
     utc_now,
 )
 
-load_dotenv()
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 
-LOG_FILE = MARKET_LOG_FILE
+LOG_FILE = BTC_FORECAST_FILE
 FORECAST_HORIZON_HOURS = 2
 ALLOWED_DIRECTIONS = {"BULLISH", "BEARISH", "SIDEWAYS"}
 REQUIRED_PREDICTION_FIELDS = {
@@ -48,7 +49,7 @@ def validate_prediction(prediction: object) -> dict:
         )
 
     direction = prediction["predicted_direction"]
-    if not isinstance(direction, str) or direction not in ALLOWED_DIRECTIONS:
+    if not isinstance(direction, str) or direction.strip().upper() not in ALLOWED_DIRECTIONS:
         raise ValueError("Gemini forecast has an unsupported predicted_direction.")
     confidence = prediction["confidence_score"]
     if (
@@ -80,7 +81,9 @@ def validate_prediction(prediction: object) -> dict:
         "predicted_scenario"
     ].strip():
         raise ValueError("Gemini predicted_scenario must be a non-empty string.")
-    return prediction
+    validated = dict(prediction)
+    validated["predicted_direction"] = direction.strip().upper()
+    return validated
 
 # ==========================================
 # 1. CHART GENERATOR (The Eyes)
@@ -202,7 +205,9 @@ def calculate_metrics(df_micro: pd.DataFrame, df_macro: pd.DataFrame) -> dict:
         "atr_15m": round(float(atr.iloc[-1]), 2),
         "recent_swing_high": round(float(high.tail(24).max()), 2),
         "recent_swing_low": round(float(low.tail(24).min()), 2),
-        "source_candle_timestamp": pd.Timestamp(df_micro.index[-1]).isoformat(),
+        "source_candle_timestamp": (
+            pd.Timestamp(df_micro.index[-1]) + pd.Timedelta(minutes=15)
+        ).isoformat(),
     }
 
 # ==========================================
@@ -265,6 +270,8 @@ def log_prediction(
 ) -> None:
     prediction = validate_prediction(prediction)
     issue_time = issued_at or utc_now()
+    if issue_time.tzinfo is None:
+        raise ValueError("Forecast issue timestamp must include a timezone.")
     issue_timestamp = to_utc_iso(issue_time)
     source_timestamp = pd.Timestamp(metrics["source_candle_timestamp"])
     if source_timestamp.tzinfo is None:
@@ -280,31 +287,44 @@ def log_prediction(
         or starting_price <= 0
     ):
         raise ValueError("Starting BTC price must be finite and positive.")
+    if not isinstance(ticker, str) or ticker.strip().upper() != "BTC-USD":
+        raise ValueError("The 2-hour forecast log accepts only the BTC-USD ticker.")
 
+    target_time = issue_time.astimezone(datetime.timezone.utc) + datetime.timedelta(
+        hours=FORECAST_HORIZON_HOURS
+    )
     record = {
-        "timestamp": issue_timestamp,
+        "forecast_id": str(uuid.uuid4()),
         "forecast_issue_timestamp": issue_timestamp,
-        "source_candle_timestamp": source_timestamp.isoformat(),
-        "target_timestamp": to_utc_iso(
-            issue_time + datetime.timedelta(hours=FORECAST_HORIZON_HOURS)
-        ),
-        "forecast_horizon_hours": FORECAST_HORIZON_HOURS,
-        "ticker": ticker,
+        "ticker": ticker.strip().upper(),
         "starting_btc_price": starting_price,
+        "source_candle_timestamp": source_timestamp.isoformat(),
+        "forecast_horizon_hours": FORECAST_HORIZON_HOURS,
+        "intended_evaluation_timestamp": to_utc_iso(target_time),
         "predicted_direction": prediction.get("predicted_direction"),
+        "expected_high": prediction.get("expected_high_next_2h"),
+        "expected_low": prediction.get("expected_low_next_2h"),
+        "projected_price": prediction.get("projected_price_in_2h"),
         "confidence_score": prediction.get("confidence_score"),
-        "expected_low_2h": prediction.get("expected_low_next_2h"),
-        "expected_high_2h": prediction.get("expected_high_next_2h"),
-        "projected_price_2h": prediction.get("projected_price_in_2h"),
         "scenario": prediction.get("predicted_scenario"),
-        "graded": "False",
-        "actual_price": "",
-        "actual_price_timestamp": "",
-        "actual_outcome": "Pending",
+        "evaluation_status": "PENDING",
+        "actual_btc_close": "",
+        "actual_close_timestamp": "",
+        "actual_high": "",
+        "actual_low": "",
+        "direction_correct": "",
+        "final_close_in_predicted_range": "",
+        "full_period_range_inside_predicted_range": "",
+        "projected_price_absolute_error": "",
+        "projected_price_percentage_error": "",
+        "evaluated_at_utc": "",
+        "evaluation_note": "",
+        "legacy_source_file": "",
+        "legacy_source_row": "",
     }
 
-    initialize_market_log(log_file)
-    append_record(log_file, MARKET_LOG_FIELDS, record)
+    initialize_btc_forecast_log(log_file)
+    append_record(log_file, BTC_FORECAST_FIELDS, record)
 
 def run_predictor(ticker: str = "BTC-USD"):
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 1. Generating charts for {ticker}...")

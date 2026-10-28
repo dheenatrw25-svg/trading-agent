@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from src import data_engine, evaluator, market_predictor, prediction_logs, pro_strategist
+from src import app, auto_run, evaluator, market_predictor, prediction_logs
 
 
 def valid_market_forecast() -> dict:
@@ -17,23 +17,69 @@ def valid_market_forecast() -> dict:
         "expected_high_next_2h": 110.0,
         "expected_low_next_2h": 90.0,
         "projected_price_in_2h": 105.0,
-        "predicted_scenario": "Price is expected to rise over the next two hours.",
+        "predicted_scenario": "BTC is expected to rise over the next two hours.",
     }
 
 
-def valid_advisory() -> dict:
+def forecast_row(issue_time: pd.Timestamp, direction: str = "BULLISH") -> dict[str, str]:
     return {
-        "direction": "UP",
-        "target_range_low": 90.0,
-        "target_range_high": 110.0,
-        "invalidation_price": 80.0,
-        "confidence_score": 7,
-        "market_regime": "Ranging",
-        "reasoning": "Price is holding above support.",
+        "forecast_id": "forecast-test-001",
+        "forecast_issue_timestamp": issue_time.isoformat(),
+        "ticker": "BTC-USD",
+        "starting_btc_price": "100",
+        "source_candle_timestamp": (issue_time - pd.Timedelta(minutes=15)).isoformat(),
+        "forecast_horizon_hours": "2",
+        "intended_evaluation_timestamp": (
+            issue_time + pd.Timedelta(hours=2)
+        ).isoformat(),
+        "predicted_direction": direction,
+        "expected_high": "110",
+        "expected_low": "90",
+        "projected_price": "105",
+        "confidence_score": "7",
+        "scenario": "Test forecast scenario.",
+        "evaluation_status": "PENDING",
+        "actual_btc_close": "",
+        "actual_close_timestamp": "",
+        "actual_high": "",
+        "actual_low": "",
+        "direction_correct": "",
+        "final_close_in_predicted_range": "",
+        "full_period_range_inside_predicted_range": "",
+        "projected_price_absolute_error": "",
+        "projected_price_percentage_error": "",
+        "evaluated_at_utc": "",
+        "evaluation_note": "",
+        "legacy_source_file": "",
+        "legacy_source_row": "",
     }
 
 
-class ForecastingFixTests(unittest.TestCase):
+def candle_data(issue_time: pd.Timestamp, close_price: float = 108.0):
+    index_15m = pd.date_range(issue_time, periods=8, freq="15min")
+    candles_15m = pd.DataFrame(
+        {
+            "Open": [100.0] * 8,
+            "High": [109.0] * 8,
+            "Low": [95.0] * 8,
+            "Close": [101.0] * 7 + [close_price],
+        },
+        index=index_15m,
+    )
+    index_1m = pd.date_range(issue_time, periods=120, freq="min")
+    candles_1m = pd.DataFrame(
+        {
+            "Open": [100.0] * 120,
+            "High": [109.0] * 120,
+            "Low": [95.0] * 120,
+            "Close": [101.0] * 119 + [close_price],
+        },
+        index=index_1m,
+    )
+    return candles_15m, candles_1m
+
+
+class ForecastLoggingAndEvaluationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.directory = Path(self.temporary_directory.name)
@@ -41,323 +87,419 @@ class ForecastingFixTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
-    def test_market_csv_appends_validated_rows_with_two_hour_timestamps(self) -> None:
-        log_file = self.directory / "market.csv"
-        issue_time = datetime.datetime(2026, 1, 1, 12, 0, tzinfo=datetime.timezone.utc)
-        metrics = {
-            "current_price": 100.0,
-            "source_candle_timestamp": "2026-01-01T11:45:00+00:00",
-        }
-
-        for _ in range(2):
-            market_predictor.log_prediction(
-                "BTC-USD",
-                metrics,
-                valid_market_forecast(),
-                log_file=log_file,
-                issued_at=issue_time,
-            )
-
-        with log_file.open(newline="", encoding="utf-8") as file:
-            rows = list(csv.DictReader(file))
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]["forecast_horizon_hours"], "2")
+    def test_valid_gemini_forecast_is_normalized_and_invalid_values_rejected(self) -> None:
+        valid = valid_market_forecast()
+        valid["predicted_direction"] = " bullish "
         self.assertEqual(
-            rows[0]["target_timestamp"],
-            "2026-01-01T14:00:00+00:00",
+            market_predictor.validate_prediction(valid)["predicted_direction"],
+            "BULLISH",
         )
-        self.assertEqual(rows[0]["source_candle_timestamp"], metrics["source_candle_timestamp"])
-        self.assertEqual(rows[0]["starting_btc_price"], "100.0")
 
-    def test_invalid_or_incomplete_ai_forecasts_are_rejected(self) -> None:
-        log_file = self.directory / "market.csv"
-        prediction_logs.initialize_market_log(log_file)
-        metrics = {
-            "current_price": 100.0,
-            "source_candle_timestamp": "2026-01-01T11:45:00+00:00",
-        }
-        missing_field = valid_market_forecast()
-        missing_field.pop("confidence_score")
-        with self.assertRaisesRegex(ValueError, "missing required fields"):
-            market_predictor.validate_prediction(missing_field)
-        with self.assertRaisesRegex(ValueError, "missing required fields"):
-            market_predictor.log_prediction(
-                "BTC-USD",
-                metrics,
-                missing_field,
-                log_file=log_file,
-                issued_at=datetime.datetime(
-                    2026, 1, 1, 12, 0, tzinfo=datetime.timezone.utc
-                ),
-            )
-
+        invalid_values = []
+        missing = valid_market_forecast()
+        del missing["predicted_scenario"]
+        invalid_values.append((missing, "missing required fields"))
+        invalid_direction = valid_market_forecast()
+        invalid_direction["predicted_direction"] = "UP"
+        invalid_values.append((invalid_direction, "unsupported"))
+        invalid_price = valid_market_forecast()
+        invalid_price["projected_price_in_2h"] = 0
+        invalid_values.append((invalid_price, "positive number"))
+        nonnumeric = valid_market_forecast()
+        nonnumeric["expected_high_next_2h"] = "110"
+        invalid_values.append((nonnumeric, "positive number"))
         inverted_range = valid_market_forecast()
         inverted_range["expected_low_next_2h"] = 120
-        with self.assertRaisesRegex(ValueError, "low price exceeds"):
-            market_predictor.validate_prediction(inverted_range)
+        invalid_values.append((inverted_range, "low price exceeds"))
+        invalid_confidence = valid_market_forecast()
+        invalid_confidence["confidence_score"] = 11
+        invalid_values.append((invalid_confidence, "confidence_score"))
+        for value, message in invalid_values:
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, message):
+                market_predictor.validate_prediction(value)
 
-        bad_direction = valid_market_forecast()
-        bad_direction["predicted_direction"] = "UP"
-        with self.assertRaisesRegex(ValueError, "unsupported"):
-            market_predictor.validate_prediction(bad_direction)
-
-        bad_confidence = valid_market_forecast()
-        bad_confidence["confidence_score"] = 11
-        with self.assertRaisesRegex(ValueError, "confidence_score"):
-            market_predictor.validate_prediction(bad_confidence)
-
-        bad_advisory = valid_advisory()
-        bad_advisory["target_range_low"] = 120
-        with self.assertRaisesRegex(ValueError, "target low exceeds"):
-            pro_strategist.validate_advisory(bad_advisory)
-        with log_file.open(newline="", encoding="utf-8") as file:
-            self.assertEqual(len(list(csv.reader(file))), 1)
-
-    def test_missing_fields_do_not_append_a_csv_row(self) -> None:
-        log_file = self.directory / "market.csv"
-        prediction_logs.initialize_market_log(log_file)
-        with self.assertRaisesRegex(ValueError, "missing required fields"):
-            prediction_logs.append_record(
-                log_file,
-                prediction_logs.MARKET_LOG_FIELDS,
-                {"timestamp": "2026-01-01T12:00:00+00:00"},
-            )
-        with log_file.open(newline="", encoding="utf-8") as file:
-            self.assertEqual(len(list(csv.reader(file))), 1)
-
-    def test_mixed_legacy_rows_migrate_without_changing_original(self) -> None:
-        legacy_file = self.directory / "predictions_log.csv"
-        app_file = self.directory / "app.csv"
-        market_file = self.directory / "market.csv"
-        app_values = [
-            "2026-01-01 10:00:00",
-            "100",
-            "UP",
-            "95",
-            "105",
-            "90",
-            "7",
-            "Legacy",
-            "Not graded",
-            "Ranging",
-            "Historical app forecast",
-        ]
-        market_values = [
-            "2026-01-01 12:00:00",
+    def test_forecast_writes_unique_utc_two_hour_record_to_its_own_schema(self) -> None:
+        log_file = self.directory / "btc_forecasts_2h.csv"
+        issue_time = datetime.datetime(
+            2026, 1, 1, 12, 0, tzinfo=datetime.timezone.utc
+        )
+        metrics = {
+            "current_price": 100.0,
+            "source_candle_timestamp": "2026-01-01T11:45:00+00:00",
+        }
+        market_predictor.log_prediction(
             "BTC-USD",
-            "100",
-            "BULLISH",
-            "7",
-            "95",
-            "110",
-            "105",
-            "Historical market forecast",
-        ]
-        with legacy_file.open("w", newline="", encoding="utf-8") as file:
+            metrics,
+            valid_market_forecast(),
+            log_file=log_file,
+            issued_at=issue_time,
+        )
+        market_predictor.log_prediction(
+            "BTC-USD",
+            metrics,
+            valid_market_forecast(),
+            log_file=log_file,
+            issued_at=issue_time,
+        )
+        with log_file.open(newline="", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            rows = list(reader)
+            self.assertEqual(reader.fieldnames, prediction_logs.BTC_FORECAST_FIELDS)
+        self.assertEqual(len(rows), 2)
+        self.assertNotEqual(rows[0]["forecast_id"], rows[1]["forecast_id"])
+        self.assertEqual(rows[0]["forecast_issue_timestamp"], issue_time.isoformat())
+        self.assertEqual(
+            rows[0]["intended_evaluation_timestamp"],
+            "2026-01-01T14:00:00+00:00",
+        )
+        self.assertEqual(rows[0]["forecast_horizon_hours"], "2")
+        self.assertEqual(rows[0]["evaluation_status"], "PENDING")
+        self.assertEqual(rows[0]["scenario"], valid_market_forecast()["predicted_scenario"])
+
+    def test_source_candle_timestamp_records_the_candle_close(self) -> None:
+        index = pd.date_range(
+            "2026-01-01T00:00:00+00:00", periods=60, freq="15min"
+        )
+        closes = pd.Series(range(100, 160), index=index, dtype=float)
+        micro = pd.DataFrame(
+            {
+                "Open": closes,
+                "High": closes + 1,
+                "Low": closes - 1,
+                "Close": closes,
+                "Volume": 1.0,
+            },
+            index=index,
+        )
+        macro = pd.DataFrame({"Close": closes})
+        metrics = market_predictor.calculate_metrics(micro, macro)
+        self.assertEqual(
+            pd.Timestamp(metrics["source_candle_timestamp"]),
+            index[-1] + pd.Timedelta(minutes=15),
+        )
+
+    def test_wrong_ticker_and_naive_timestamps_are_rejected(self) -> None:
+        metrics = {
+            "current_price": 100.0,
+            "source_candle_timestamp": "2026-01-01T11:45:00+00:00",
+        }
+        with self.assertRaisesRegex(ValueError, "BTC-USD"):
+            market_predictor.log_prediction(
+                "ETH-USD", metrics, valid_market_forecast(),
+                log_file=self.directory / "btc.csv",
+                issued_at=datetime.datetime(2026, 1, 1, 12, tzinfo=datetime.timezone.utc),
+            )
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            prediction_logs.to_utc_iso(datetime.datetime(2026, 1, 1, 12))
+
+    def test_advisory_and_btc_logs_are_separate_and_schema_checked(self) -> None:
+        advisory_file = self.directory / "advisory_log.csv"
+        btc_file = self.directory / "btc_forecasts_2h.csv"
+        prediction_logs.initialize_advisory_log(advisory_file)
+        prediction_logs.initialize_btc_forecast_log(btc_file)
+        self.assertNotEqual(advisory_file, btc_file)
+        with advisory_file.open(newline="", encoding="utf-8") as file:
+            self.assertEqual(
+                next(csv.reader(file)), prediction_logs.ADVISORY_LOG_FIELDS
+            )
+        with btc_file.open(newline="", encoding="utf-8") as file:
+            self.assertEqual(next(csv.reader(file)), prediction_logs.BTC_FORECAST_FIELDS)
+        self.assertEqual(app.HISTORY_FILE, prediction_logs.ADVISORY_LOG_FILE)
+        self.assertEqual(auto_run.CSV_FILENAME, str(prediction_logs.ADVISORY_LOG_FILE))
+        with self.assertRaisesRegex(ValueError, "unexpected CSV header"):
+            prediction_logs.append_record(
+                advisory_file,
+                prediction_logs.BTC_FORECAST_FIELDS,
+                {field: "" for field in prediction_logs.BTC_FORECAST_FIELDS},
+            )
+
+    def test_dashboard_pipeline_appends_only_to_advisory_log(self) -> None:
+        advisory_file = self.directory / "advisory_log.csv"
+        spot_data = pd.DataFrame(
+            {"Close": [100.0]},
+            index=pd.DatetimeIndex(["2026-01-01T11:45:00+00:00"]),
+        )
+        decision = {
+            "direction": "UP",
+            "target_range_low": 95.0,
+            "target_range_high": 110.0,
+            "invalidation_price": 90.0,
+            "confidence_score": 7,
+            "market_regime": "Ranging",
+            "reasoning": "Dashboard advisory test.",
+        }
+        with patch.object(app, "HISTORY_FILE", advisory_file):
+            app.log_prediction(decision, {"spot": {"current_close": 100.0}}, spot_data)
+        with advisory_file.open(newline="", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            row = next(reader)
+            self.assertEqual(reader.fieldnames, prediction_logs.ADVISORY_LOG_FIELDS)
+        self.assertEqual(row["direction"], "UP")
+        self.assertEqual(row["forecast_horizon_hours"], "4")
+        self.assertEqual(row["reasoning"], "Dashboard advisory test.")
+
+    def test_legacy_records_are_backed_up_and_not_assumed_evaluable(self) -> None:
+        logs = self.directory / "logs"
+        backups = logs / "backups"
+        logs.mkdir()
+        backups.mkdir()
+        old_market = logs / "market_predictions_log.csv"
+        old_app = logs / "app_predictions_log.csv"
+        old_shared = logs / "predictions_log.csv"
+        with old_market.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=prediction_logs.LEGACY_MARKET_FIELDS)
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "timestamp": "2026-01-01T12:00:00+00:00",
+                    "forecast_issue_timestamp": "2026-01-01T12:00:00+00:00",
+                    "source_candle_timestamp": "",
+                    "target_timestamp": "",
+                    "forecast_horizon_hours": "2",
+                    "ticker": "BTC-USD",
+                    "starting_btc_price": "100",
+                    "predicted_direction": "BULLISH",
+                    "confidence_score": "7",
+                    "expected_low_2h": "90",
+                    "expected_high_2h": "110",
+                    "projected_price_2h": "105",
+                    "scenario": "Old forecast",
+                    "graded": "False",
+                    "actual_price": "",
+                    "actual_price_timestamp": "",
+                    "actual_outcome": "Pending",
+                }
+            )
+        with old_app.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=prediction_logs.APP_LOG_FIELDS)
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "timestamp": "2026-01-01 10:00:00",
+                    "direction": "UP",
+                    "reasoning": "Old advisory",
+                }
+            )
+        with old_shared.open("w", newline="", encoding="utf-8") as file:
             writer = csv.writer(file)
             writer.writerow(prediction_logs.LEGACY_APP_FIELDS)
-            writer.writerow(app_values)
-            writer.writerow(market_values)
-        original_bytes = legacy_file.read_bytes()
+            writer.writerow(
+                [
+                    "2026-01-01 10:00:00",
+                    "BTC-USD",
+                    "100",
+                    "BULLISH",
+                    "7",
+                    "90",
+                    "110",
+                    "105",
+                    "Legacy market-format row",
+                ]
+            )
+        original_market_bytes = old_market.read_bytes()
+        original_app_bytes = old_app.read_bytes()
 
-        prediction_logs.initialize_app_log(app_file, legacy_file=legacy_file)
-        prediction_logs.initialize_market_log(market_file, legacy_file=legacy_file)
+        forecast_path = logs / "btc_forecasts_2h.csv"
+        advisory_path = logs / "advisory_log.csv"
+        with (
+            patch.object(prediction_logs, "LOGS_DIR", logs),
+            patch.object(prediction_logs, "BTC_FORECAST_FILE", forecast_path),
+            patch.object(prediction_logs, "ADVISORY_LOG_FILE", advisory_path),
+            patch.object(prediction_logs, "LEGACY_MARKET_LOG_FILE", old_market),
+            patch.object(prediction_logs, "LEGACY_APP_LOG_FILE", old_app),
+            patch.object(prediction_logs, "LEGACY_SHARED_LOG_FILE", old_shared),
+        ):
+            prediction_logs.initialize_btc_forecast_log()
+            prediction_logs.initialize_advisory_log()
 
-        with app_file.open(newline="", encoding="utf-8") as file:
-            app_rows = list(csv.DictReader(file))
-        with market_file.open(newline="", encoding="utf-8") as file:
-            market_rows = list(csv.DictReader(file))
-        self.assertEqual(len(app_rows), 1)
-        self.assertEqual(app_rows[0]["graded"], "Legacy")
-        self.assertEqual(app_rows[0]["target_timestamp"], "")
-        self.assertEqual(len(market_rows), 1)
-        self.assertEqual(market_rows[0]["graded"], "Legacy")
-        self.assertEqual(market_rows[0]["source_candle_timestamp"], "")
-        self.assertEqual(legacy_file.read_bytes(), original_bytes)
+        with forecast_path.open(newline="", encoding="utf-8") as file:
+            forecasts = list(csv.DictReader(file))
+        with advisory_path.open(newline="", encoding="utf-8") as file:
+            advisories = list(csv.DictReader(file))
+        self.assertEqual(len(forecasts), 1)
+        self.assertEqual(forecasts[0]["evaluation_status"], "NEEDS_REVIEW")
+        self.assertEqual(forecasts[0]["source_candle_timestamp"], "")
+        self.assertEqual(len(advisories), 1)
+        self.assertEqual(advisories[0]["forecast_horizon_hours"], "")
+        self.assertEqual(old_market.read_bytes(), original_market_bytes)
+        self.assertEqual(old_app.read_bytes(), original_app_bytes)
+        self.assertEqual(
+            (backups / "market_predictions_log.csv.pre-phase1.bak").read_bytes(),
+            original_market_bytes,
+        )
+        self.assertEqual(
+            (backups / "app_predictions_log.csv.pre-phase1.bak").read_bytes(),
+            original_app_bytes,
+        )
 
-    def test_target_time_must_match_horizon_and_source_candle(self) -> None:
-        row = pd.Series(
+    def test_target_timestamp_requires_aware_utc_and_two_hour_horizon(self) -> None:
+        issue = pd.Timestamp("2026-01-01T12:00:00+00:00")
+        row = forecast_row(issue)
+        parsed_issue, target = evaluator._validate_forecast_timestamps(row)
+        self.assertEqual(parsed_issue, issue)
+        self.assertEqual(target, issue + pd.Timedelta(hours=2))
+        row["forecast_issue_timestamp"] = "2026-01-01 12:00:00"
+        with self.assertRaisesRegex(ValueError, "timezone"):
+            evaluator._validate_forecast_timestamps(row)
+
+    def test_direction_close_range_and_price_error_are_scored_separately(self) -> None:
+        issue = pd.Timestamp("2026-01-01T12:00:00+00:00")
+        candles_15m, candles_1m = candle_data(issue, close_price=108.0)
+        result = evaluator.evaluate_forecast(
+            forecast_row(issue, "BULLISH"), candles_15m, candles_1m
+        )
+        self.assertTrue(result["direction_correct"])
+        self.assertTrue(result["final_close_in_predicted_range"])
+        self.assertTrue(result["full_period_range_inside_predicted_range"])
+        self.assertEqual(result["projected_price_absolute_error"], 3.0)
+        self.assertAlmostEqual(result["projected_price_percentage_error"], 100 * 3 / 105)
+        self.assertEqual(result["actual_close_timestamp"], (issue + pd.Timedelta(hours=2)).isoformat())
+
+        wrong = evaluator.evaluate_forecast(
+            forecast_row(issue, "BEARISH"), candles_15m, candles_1m
+        )
+        self.assertFalse(wrong["direction_correct"])
+
+    def test_final_close_and_full_period_range_are_distinct(self) -> None:
+        issue = pd.Timestamp("2026-01-01T12:00:00+00:00")
+        candles_15m, candles_1m = candle_data(issue, close_price=108.0)
+        candles_15m.iloc[2, candles_15m.columns.get_loc("High")] = 115.0
+        result = evaluator.evaluate_forecast(
+            forecast_row(issue), candles_15m, candles_1m
+        )
+        self.assertTrue(result["final_close_in_predicted_range"])
+        self.assertFalse(result["full_period_range_inside_predicted_range"])
+
+    def test_sideways_direction_is_not_applicable_and_range_is_scored(self) -> None:
+        issue = pd.Timestamp("2026-01-01T12:00:00+00:00")
+        candles_15m, candles_1m = candle_data(issue, close_price=108.0)
+        result = evaluator.evaluate_forecast(
+            forecast_row(issue, "SIDEWAYS"), candles_15m, candles_1m
+        )
+        self.assertEqual(result["direction_correct"], "")
+        self.assertTrue(result["final_close_in_predicted_range"])
+
+    def test_missing_or_misaligned_candles_are_not_graded(self) -> None:
+        issue = pd.Timestamp("2026-01-01T12:00:00+00:00")
+        candles_15m, candles_1m = candle_data(issue)
+        candles_15m = candles_15m.drop(candles_15m.index[3])
+        candles_1m = candles_1m.drop(candles_1m.index[45:60])
+        with self.assertRaisesRegex(evaluator.EvaluationDataUnavailable, "Missing"):
+            evaluator.evaluate_forecast(forecast_row(issue), candles_15m, candles_1m)
+
+    def test_unaligned_expiry_uses_timestamped_minute_close(self) -> None:
+        issue = pd.Timestamp("2026-01-01T12:05:30+00:00")
+        target = issue + pd.Timedelta(hours=2)
+        row = forecast_row(issue)
+        candles_1m = pd.DataFrame(
             {
-                "forecast_issue_timestamp": "2026-01-01T12:00:00+00:00",
-                "source_candle_timestamp": "2026-01-01T11:45:00+00:00",
-                "target_timestamp": "2026-01-01T14:00:00+00:00",
-                "forecast_horizon_hours": 2,
+                "Open": [100.0] * 120,
+                "High": [109.0] * 120,
+                "Low": [95.0] * 120,
+                "Close": [101.0] * 119 + [108.0],
+            },
+            index=pd.date_range(
+                issue.floor("min"), periods=120, freq="min"
+            ),
+        )
+        candles_15m = pd.DataFrame(
+            columns=["Open", "High", "Low", "Close"],
+            index=pd.DatetimeIndex([], tz="UTC"),
+        )
+        result = evaluator.evaluate_forecast(row, candles_15m, candles_1m)
+        self.assertEqual(
+            result["actual_close_timestamp"],
+            (target.floor("min")).isoformat(),
+        )
+        self.assertIn("latest minute close", result["evaluation_note"])
+
+    def test_not_due_forecasts_are_left_pending_without_market_fetch(self) -> None:
+        path = self.directory / "btc.csv"
+        prediction_logs.initialize_btc_forecast_log(path)
+        issue = pd.Timestamp.now(tz="UTC").floor("s")
+        row = forecast_row(issue)
+        with path.open("a", newline="", encoding="utf-8") as file:
+            csv.DictWriter(file, fieldnames=prediction_logs.BTC_FORECAST_FIELDS).writerow(row)
+        with patch.object(evaluator, "_fetch_evaluation_candles") as fetch:
+            result = evaluator.grade_pending_predictions(
+                path, now=issue + pd.Timedelta(hours=1)
+            )
+        fetch.assert_not_called()
+        self.assertEqual(result["pending"], 1)
+        with path.open(newline="", encoding="utf-8") as file:
+            self.assertEqual(next(csv.DictReader(file))["evaluation_status"], "PENDING")
+
+    def test_csv_is_updated_once_and_rag_upsert_uses_forecast_id(self) -> None:
+        path = self.directory / "btc.csv"
+        prediction_logs.initialize_btc_forecast_log(path)
+        issue = pd.Timestamp("2026-01-01T12:00:00+00:00")
+        row = forecast_row(issue)
+        with path.open("a", newline="", encoding="utf-8") as file:
+            csv.DictWriter(file, fieldnames=prediction_logs.BTC_FORECAST_FIELDS).writerow(row)
+        candles_15m, candles_1m = candle_data(issue)
+        now = issue + pd.Timedelta(hours=3)
+        with patch.object(
+            evaluator, "_fetch_evaluation_candles", return_value=(candles_15m, candles_1m)
+        ), patch.object(evaluator, "store_memory") as store_memory:
+            first = evaluator.grade_pending_predictions(path, now=now)
+            second = evaluator.grade_pending_predictions(path, now=now)
+        self.assertEqual(first["graded"], 1)
+        self.assertEqual(first["memorized"], 1)
+        self.assertEqual(second["graded"], 0)
+        self.assertEqual(store_memory.call_count, 1)
+        self.assertEqual(store_memory.call_args.args[0]["forecast_id"], row["forecast_id"])
+        with path.open(newline="", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            saved = next(reader)
+            self.assertEqual(reader.fieldnames, prediction_logs.BTC_FORECAST_FIELDS)
+        self.assertEqual(saved["evaluation_status"], "EVALUATED")
+        self.assertEqual(saved["actual_btc_close"], "108.0")
+        self.assertEqual(saved["final_close_in_predicted_range"], "True")
+
+    def test_rag_memory_upserts_by_stable_forecast_id(self) -> None:
+        row = forecast_row(pd.Timestamp("2026-01-01T12:00:00+00:00"))
+        row.update(
+            {
+                "actual_btc_close": "108",
+                "actual_close_timestamp": "2026-01-01T14:00:00+00:00",
+                "actual_high": "109",
+                "actual_low": "95",
+                "direction_correct": "True",
+                "final_close_in_predicted_range": "True",
+                "full_period_range_inside_predicted_range": "True",
+                "evaluation_status": "EVALUATED",
             }
         )
-        target = evaluator._validate_forecast_timestamps(row, 2)
-        self.assertEqual(target, pd.Timestamp("2026-01-01T14:00:00+00:00"))
-
-        row["target_timestamp"] = "2026-01-01T15:00:00+00:00"
-        with self.assertRaisesRegex(ValueError, "does not match"):
-            evaluator._validate_forecast_timestamps(row, 2)
-
-        row["target_timestamp"] = "2026-01-01T14:00:00+00:00"
-        row["source_candle_timestamp"] = "2026-01-01T12:01:00+00:00"
-        with self.assertRaisesRegex(ValueError, "later than"):
-            evaluator._validate_forecast_timestamps(row, 2)
-
-    def test_missing_evaluation_price_keeps_forecast_pending(self) -> None:
-        log_file = self.directory / "market.csv"
-        issue_time = pd.Timestamp.now(tz="UTC").floor("s") - pd.Timedelta(hours=3)
-        source_time = issue_time - pd.Timedelta(minutes=15)
-        target_time = issue_time + pd.Timedelta(hours=2)
-        row = {
-            "timestamp": issue_time.isoformat(),
-            "forecast_issue_timestamp": issue_time.isoformat(),
-            "source_candle_timestamp": source_time.isoformat(),
-            "target_timestamp": target_time.isoformat(),
-            "forecast_horizon_hours": 2,
-            "ticker": "BTC-USD",
-            "starting_btc_price": 100.0,
-            "predicted_direction": "BULLISH",
-            "confidence_score": 7,
-            "expected_low_2h": 95.0,
-            "expected_high_2h": 110.0,
-            "projected_price_2h": 105.0,
-            "scenario": "Test forecast",
-            "graded": "False",
-            "actual_price": "",
-            "actual_price_timestamp": "",
-            "actual_outcome": "Pending",
-        }
-        prediction_logs.initialize_market_log(log_file)
-        prediction_logs.append_record(log_file, prediction_logs.MARKET_LOG_FIELDS, row)
-
-        with patch.object(
-            evaluator,
-            "_fetch_price_at",
-            side_effect=RuntimeError("No matching historical price."),
-        ), patch.object(evaluator, "store_memory") as store_memory:
-            summary = evaluator.grade_pending_predictions(log_file)
-
-        with log_file.open(newline="", encoding="utf-8") as file:
-            saved = next(csv.DictReader(file))
-        self.assertEqual(summary["graded"], 0)
-        self.assertEqual(summary["pending"], 1)
-        self.assertEqual(summary["errors"], 1)
-        self.assertEqual(saved["graded"], "False")
-        self.assertEqual(saved["actual_outcome"], "Pending")
-        store_memory.assert_not_called()
-
-    def test_successful_grading_is_saved_and_not_repeated(self) -> None:
-        log_file = self.directory / "market.csv"
-        issue_time = pd.Timestamp.now(tz="UTC").floor("s") - pd.Timedelta(hours=3)
-        target_time = issue_time + pd.Timedelta(hours=2)
-        row = {
-            "timestamp": issue_time.isoformat(),
-            "forecast_issue_timestamp": issue_time.isoformat(),
-            "source_candle_timestamp": (
-                issue_time - pd.Timedelta(minutes=15)
-            ).isoformat(),
-            "target_timestamp": target_time.isoformat(),
-            "forecast_horizon_hours": 2,
-            "ticker": "BTC-USD",
-            "starting_btc_price": 100.0,
-            "predicted_direction": "BULLISH",
-            "confidence_score": 7,
-            "expected_low_2h": 95.0,
-            "expected_high_2h": 110.0,
-            "projected_price_2h": 105.0,
-            "scenario": "Test forecast",
-            "graded": "False",
-            "actual_price": "",
-            "actual_price_timestamp": "",
-            "actual_outcome": "Pending",
-        }
-        prediction_logs.initialize_market_log(log_file)
-        prediction_logs.append_record(log_file, prediction_logs.MARKET_LOG_FIELDS, row)
-        price_timestamp = target_time - pd.Timedelta(minutes=1)
-
-        with patch.object(
-            evaluator,
-            "_fetch_price_at",
-            return_value=(101.0, price_timestamp),
-        ), patch.object(evaluator, "store_memory") as store_memory:
-            first_result = evaluator.grade_pending_predictions(log_file)
-            second_result = evaluator.grade_pending_predictions(log_file)
-
-        with log_file.open(newline="", encoding="utf-8") as file:
-            saved = next(csv.DictReader(file))
+        with patch.object(evaluator, "TRADE_MEMORIES") as collection:
+            evaluator.store_memory(row)
+            evaluator.store_memory(row)
+        self.assertEqual(collection.upsert.call_count, 2)
+        self.assertEqual(collection.upsert.call_args_list[0].kwargs["ids"], [
+            row["forecast_id"]
+        ])
         self.assertEqual(
-            first_result,
-            {"graded": 1, "memorized": 1, "errors": 0, "pending": 0},
+            collection.upsert.call_args_list[1].kwargs["ids"],
+            [row["forecast_id"]],
         )
-        self.assertEqual(
-            second_result,
-            {"graded": 0, "memorized": 0, "errors": 0, "pending": 0},
-        )
-        self.assertEqual(saved["graded"], "True")
-        self.assertEqual(saved["actual_price"], "101.0")
-        self.assertEqual(saved["actual_price_timestamp"], price_timestamp.isoformat())
-        self.assertEqual(saved["actual_outcome"], "Win")
-        store_memory.assert_called_once()
 
-    def test_price_lookup_uses_one_minute_close_at_target(self) -> None:
-        target_time = pd.Timestamp("2026-01-01T12:30:00+00:00")
-        history = pd.DataFrame(
-            {"Close": [123.0]},
-            index=pd.DatetimeIndex([target_time - pd.Timedelta(minutes=1)]),
-        )
-        with patch.object(evaluator.yf, "download", return_value=history) as download:
-            price, price_timestamp = evaluator._fetch_price_at(target_time)
-        self.assertEqual(price, 123.0)
-        self.assertEqual(price_timestamp, target_time)
-        self.assertEqual(download.call_args.kwargs["interval"], "1m")
-
-    def test_stale_price_is_not_used_to_grade(self) -> None:
-        target_time = pd.Timestamp("2026-01-01T12:30:00+00:00")
-        stale_history = pd.DataFrame(
-            {"Close": [123.0]},
-            index=pd.DatetimeIndex([target_time - pd.Timedelta(minutes=3)]),
-        )
-        with patch.object(evaluator.yf, "download", return_value=stale_history):
-            with self.assertRaisesRegex(RuntimeError, "within one minute"):
-                evaluator._fetch_price_at(target_time)
-
-    def test_incomplete_candles_are_excluded(self) -> None:
-        now = pd.Timestamp.now(tz="UTC")
-        older_candle = now.floor("15min") - pd.Timedelta(minutes=30)
-        previous_candle = now.floor("15min") - pd.Timedelta(minutes=15)
-        forming_candle = now.floor("15min")
-        candles = pd.DataFrame(
-            {
-                "Open": [100.0, 101.0, 102.0],
-                "High": [102.0, 103.0, 104.0],
-                "Low": [99.0, 100.0, 101.0],
-                "Close": [101.0, 102.0, 103.0],
-                "Volume": [1.0, 1.0, 1.0],
-            },
-            index=pd.DatetimeIndex([older_candle, previous_candle, forming_candle]),
-        )
-        with patch.object(market_predictor.yf, "download", return_value=candles):
-            confirmed = market_predictor.download_clean_df(
-                "BTC-USD",
-                interval="15m",
-                period="1d",
+    def test_unreliable_legacy_row_gets_needs_review_not_a_fake_grade(self) -> None:
+        path = self.directory / "btc.csv"
+        prediction_logs.initialize_btc_forecast_log(path)
+        row = forecast_row(pd.Timestamp("2026-01-01T12:00:00+00:00"))
+        row["source_candle_timestamp"] = ""
+        row["starting_btc_price"] = ""
+        with path.open("a", newline="", encoding="utf-8") as file:
+            csv.DictWriter(file, fieldnames=prediction_logs.BTC_FORECAST_FIELDS).writerow(row)
+        with patch.object(evaluator, "_fetch_evaluation_candles") as fetch:
+            summary = evaluator.grade_pending_predictions(
+                path, now=pd.Timestamp("2026-01-01T15:00:00+00:00")
             )
-        self.assertEqual(len(confirmed), 2)
-        self.assertEqual(confirmed.index[-1], previous_candle)
-
-        confirmed_spot = data_engine._confirmed_candles(candles, "15m")
-        self.assertEqual(len(confirmed_spot), 2)
-        self.assertEqual(confirmed_spot.index[-1], previous_candle)
-
-    def test_empty_and_insufficient_candle_data_fail_safely(self) -> None:
-        empty_candles = pd.DataFrame(
-            columns=["Open", "High", "Low", "Close", "Volume"],
-            index=pd.DatetimeIndex([]),
-        )
-        with patch.object(market_predictor.yf, "download", return_value=empty_candles):
-            with self.assertRaisesRegex(RuntimeError, "No 15m candle data"):
-                market_predictor.download_clean_df("BTC-USD", "15m", "1d")
-
-        with self.assertRaisesRegex(ValueError, "Insufficient confirmed"):
-            market_predictor.calculate_metrics(
-                pd.DataFrame(columns=["Close", "High", "Low"]),
-                pd.DataFrame(columns=["Close"]),
-            )
-        with self.assertRaisesRegex(RuntimeError, "no BTC-USD spot candles"):
-            data_engine._confirmed_candles(empty_candles, "4h")
+        fetch.assert_not_called()
+        self.assertEqual(summary["needs_review"], 1)
+        with path.open(newline="", encoding="utf-8") as file:
+            saved = next(csv.DictReader(file))
+        self.assertEqual(saved["evaluation_status"], "NEEDS_REVIEW")
+        self.assertEqual(saved["actual_btc_close"], "")
 
 
 if __name__ == "__main__":

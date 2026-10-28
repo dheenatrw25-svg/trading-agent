@@ -34,7 +34,7 @@ from PIL import Image
 # ---------------------------------------------------------------------------
 # Paths & constants
 # ---------------------------------------------------------------------------
-from .paths import ASSETS_DIR, LOGS_DIR
+from .paths import ASSETS_DIR, LOGS_DIR, PROJECT_ROOT
 
 STATE_PATH = LOGS_DIR / "agent_state.json"
 TRADES_PATH = LOGS_DIR / "paper_trades.csv"
@@ -555,7 +555,7 @@ def compute_metrics(df_4h: pd.DataFrame, df_15m: pd.DataFrame) -> dict[str, Any]
 
 
 def get_genai_client() -> genai.Client:
-    load_dotenv()
+    load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError(
