@@ -3,7 +3,7 @@
 venv/
 __pycache__/
 *.py[cod]
-agent_state.json
+/logs/agent_state.json
 chroma_db/
 temp_macro.png
 temp_micro.png

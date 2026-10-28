@@ -1,7 +1,7 @@
-import os
 import json
 import datetime
 import math
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -12,7 +12,8 @@ from PIL import Image
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
-from prediction_logs import (
+from .paths import ASSETS_DIR
+from .prediction_logs import (
     MARKET_LOG_FIELDS,
     MARKET_LOG_FILE,
     append_record,
@@ -111,7 +112,10 @@ def download_clean_df(ticker: str, interval: str, period: str) -> pd.DataFrame:
         raise RuntimeError(f"No complete {interval} candles returned for {ticker}.")
     return df
 
-def generate_dual_chart(ticker: str = "BTC-USD", output_path: str = "prediction_chart.png"):
+def generate_dual_chart(
+    ticker: str = "BTC-USD",
+    output_path: str | Path = ASSETS_DIR / "prediction_chart.png",
+):
     # Macro Trend (1-Hour candles) and Micro Structure (15-Minute candles)
     df_macro = download_clean_df(ticker, interval="1h", period="10d")
     df_micro = download_clean_df(ticker, interval="15m", period="3d")
@@ -129,32 +133,31 @@ def generate_dual_chart(ticker: str = "BTC-USD", output_path: str = "prediction_
         rc={'font.size': 7}
     )
 
-    mpf.plot(
-        slice_macro, type='candle', volume=True, mav=(20, 50),
-        style=custom_style, title=f"{ticker} - Macro Trend (1H)",
-        savefig="temp_macro.png"
-    )
-    mpf.plot(
-        slice_micro, type='candle', volume=True, mav=(20, 50),
-        style=custom_style, title=f"{ticker} - Short-Term Structure (15m)",
-        savefig="temp_micro.png"
-    )
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="forecast-", dir=ASSETS_DIR) as temp_dir:
+        macro_path = Path(temp_dir) / "macro.png"
+        micro_path = Path(temp_dir) / "micro.png"
+        mpf.plot(
+            slice_macro, type="candle", volume=True, mav=(20, 50),
+            style=custom_style, title=f"{ticker} - Macro Trend (1H)",
+            savefig=str(macro_path),
+        )
+        mpf.plot(
+            slice_micro, type="candle", volume=True, mav=(20, 50),
+            style=custom_style, title=f"{ticker} - Short-Term Structure (15m)",
+            savefig=str(micro_path),
+        )
 
-    # Combine both charts vertically into one image
-    img_top = Image.open("temp_macro.png")
-    img_bottom = Image.open("temp_micro.png")
+        with Image.open(macro_path) as img_top, Image.open(micro_path) as img_bottom:
+            width = max(img_top.width, img_bottom.width)
+            height = img_top.height + img_bottom.height
+            combined = Image.new("RGB", (width, height))
+            combined.paste(img_top, (0, 0))
+            combined.paste(img_bottom, (0, img_top.height))
+            combined.save(output_file)
 
-    width = max(img_top.width, img_bottom.width)
-    height = img_top.height + img_bottom.height
-    combined = Image.new("RGB", (width, height))
-    combined.paste(img_top, (0, 0))
-    combined.paste(img_bottom, (0, img_top.height))
-    combined.save(output_path)
-
-    os.remove("temp_macro.png")
-    os.remove("temp_micro.png")
-
-    return slice_macro, slice_micro, output_path
+    return slice_macro, slice_micro, str(output_file)
 
 # ==========================================
 # 2. MATHEMATICAL INDICATORS (The Calculator)

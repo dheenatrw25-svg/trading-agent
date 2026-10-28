@@ -4,11 +4,11 @@ import math
 from pathlib import Path
 from typing import Any
 
+from .paths import LOGS_DIR
 
-BASE_DIR = Path(__file__).resolve().parent
-LEGACY_LOG_FILE = BASE_DIR / "predictions_log.csv"
-APP_LOG_FILE = BASE_DIR / "app_predictions_log.csv"
-MARKET_LOG_FILE = BASE_DIR / "market_predictions_log.csv"
+LEGACY_LOG_FILE = LOGS_DIR / "predictions_log.csv"
+APP_LOG_FILE = LOGS_DIR / "app_predictions_log.csv"
+MARKET_LOG_FILE = LOGS_DIR / "market_predictions_log.csv"
 
 APP_LOG_FIELDS = [
     "timestamp",

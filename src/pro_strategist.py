@@ -9,7 +9,9 @@ from google import genai
 from google.genai import types
 from PIL import Image
 
-from evaluator import retrieve_past_lessons
+from . import chart_engine, data_engine
+from .evaluator import retrieve_past_lessons
+from .paths import ASSETS_DIR
 
 load_dotenv()
 
@@ -83,7 +85,7 @@ def validate_advisory(advisory: object) -> dict[str, Any]:
 
 def generate_trading_advisory(
     market_context: dict[str, Any],
-    chart_image_path: str = "prediction_chart.png",
+    chart_image_path: str = str(ASSETS_DIR / "prediction_chart.png"),
 ) -> dict[str, Any]:
     image_path = Path(chart_image_path)
     if not image_path.is_file():
@@ -139,18 +141,15 @@ def generate_trading_advisory(
 
 
 if __name__ == "__main__":
-    import data_engine
-    import chart_engine
-
     full_context = data_engine.compile_market_context()
     spot_data = data_engine.fetch_spot_data()
     profile_levels = chart_engine.generate_pro_chart(
         spot_data,
-        filename="prediction_chart.png",
+        filename=str(ASSETS_DIR / "prediction_chart.png"),
     )
     full_context["volume_profile"] = profile_levels
     advisory = generate_trading_advisory(
         full_context,
-        chart_image_path="prediction_chart.png",
+        chart_image_path=str(ASSETS_DIR / "prediction_chart.png"),
     )
     print(json.dumps(advisory, indent=2))

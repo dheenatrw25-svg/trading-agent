@@ -1,5 +1,4 @@
 import datetime
-from pathlib import Path
 from threading import Lock
 from typing import Any
 
@@ -7,10 +6,9 @@ import pandas as pd
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
-import chart_engine
-import data_engine
-import pro_strategist
-from prediction_logs import (
+from . import chart_engine, data_engine, pro_strategist
+from .paths import ASSETS_DIR, PROJECT_ROOT
+from .prediction_logs import (
     APP_LOG_FIELDS,
     APP_LOG_FILE,
     append_record,
@@ -20,9 +18,8 @@ from prediction_logs import (
 )
 
 
-BASE_DIR = Path(__file__).resolve().parent
-INDEX_FILE = BASE_DIR / "templates" / "index.html"
-CHART_FILE = BASE_DIR / "prediction_chart.png"
+INDEX_FILE = PROJECT_ROOT / "templates" / "index.html"
+CHART_FILE = ASSETS_DIR / "prediction_chart.png"
 HISTORY_FILE = APP_LOG_FILE
 FORECAST_HORIZON_HOURS = 4
 ANALYSIS_LOCK = Lock()

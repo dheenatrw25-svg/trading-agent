@@ -7,14 +7,15 @@ import chromadb
 import pandas as pd
 import yfinance as yf
 
-from prediction_logs import (
+from .paths import PROJECT_ROOT
+from .prediction_logs import (
     APP_LOG_FILE,
     MARKET_LOG_FILE,
     initialize_app_log,
     initialize_market_log,
 )
 
-CHROMA_CLIENT = chromadb.PersistentClient(path="chroma_db")
+CHROMA_CLIENT = chromadb.PersistentClient(path=str(PROJECT_ROOT / "chroma_db"))
 TRADE_MEMORIES = CHROMA_CLIENT.get_or_create_collection(name="trade_memories")
 MARKET_COLUMNS = {
     "forecast_issue_timestamp",

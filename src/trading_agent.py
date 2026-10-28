@@ -34,10 +34,11 @@ from PIL import Image
 # ---------------------------------------------------------------------------
 # Paths & constants
 # ---------------------------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent
-STATE_PATH = BASE_DIR / "agent_state.json"
-TRADES_PATH = BASE_DIR / "paper_trades.csv"
-DUAL_CHART_PATH = BASE_DIR / "dual_chart.png"
+from .paths import ASSETS_DIR, LOGS_DIR
+
+STATE_PATH = LOGS_DIR / "agent_state.json"
+TRADES_PATH = LOGS_DIR / "paper_trades.csv"
+DUAL_CHART_PATH = ASSETS_DIR / "dual_chart.png"
 
 STARTING_BALANCE = 10_000.00
 DAILY_DRAWDOWN_PCT = 0.03  # lock if daily realized PnL < -3% of starting balance

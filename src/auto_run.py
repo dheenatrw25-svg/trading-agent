@@ -4,11 +4,8 @@ from pathlib import Path
 
 import schedule
 
-import chart_engine
-import data_engine
-import market_predictor
-import pro_strategist
-from prediction_logs import (
+from . import chart_engine, data_engine, market_predictor, pro_strategist
+from .prediction_logs import (
     APP_LOG_FIELDS,
     APP_LOG_FILE,
     append_record,

@@ -1,9 +1,11 @@
+from pathlib import Path
 from typing import Any
 
 import mplfinance as mpf
 import numpy as np
 import pandas as pd
 
+from .paths import ASSETS_DIR
 
 def calculate_volume_profile(
     df: pd.DataFrame,
@@ -75,8 +77,9 @@ def calculate_volume_profile(
 
 def generate_pro_chart(
     df: pd.DataFrame,
-    filename: str = "prediction_chart.png",
+    filename: str = str(ASSETS_DIR / "prediction_chart.png"),
 ) -> dict[str, float]:
+    Path(filename).parent.mkdir(parents=True, exist_ok=True)
     levels = calculate_volume_profile(df)
     chart_data = df.dropna().copy()
     market_colors = mpf.make_marketcolors(
@@ -117,7 +120,7 @@ def generate_pro_chart(
 
 
 if __name__ == "__main__":
-    import data_engine
+    from . import data_engine
 
     market_data = data_engine.fetch_spot_data()
     profile_levels: dict[str, Any] = generate_pro_chart(market_data)

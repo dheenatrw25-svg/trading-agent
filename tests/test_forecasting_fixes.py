@@ -7,11 +7,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-import data_engine
-import evaluator
-import market_predictor
-import prediction_logs
-import pro_strategist
+from src import data_engine, evaluator, market_predictor, prediction_logs, pro_strategist
 
 
 def valid_market_forecast() -> dict:
