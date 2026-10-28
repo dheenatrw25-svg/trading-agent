@@ -1,6 +1,8 @@
 import json
+import math
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
@@ -8,6 +10,34 @@ import yfinance as yf
 
 BINANCE_FUTURES_BASE_URL = "https://fapi.binance.com"
 REQUEST_TIMEOUT_SECONDS = 10
+
+
+def _confirmed_candles(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    if df.empty:
+        raise RuntimeError("yfinance returned no BTC-USD spot candles.")
+
+    interval_delta = pd.Timedelta(interval)
+    timestamps = pd.to_datetime(df.index, utc=True, errors="coerce")
+    now_utc = pd.Timestamp.now(tz="UTC")
+    confirmed = timestamps.notna() & (timestamps + interval_delta <= now_utc)
+    result = df.loc[confirmed].copy()
+    result.index = timestamps[confirmed]
+    result = result.loc[~result.index.duplicated(keep="last")].sort_index()
+    result = result.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+    ohlcv = result[["Open", "High", "Low", "Close", "Volume"]].to_numpy(dtype=float)
+    valid_rows = (
+        np.isfinite(ohlcv).all(axis=1)
+        & (ohlcv[:, :4] > 0).all(axis=1)
+        & (ohlcv[:, 1] >= ohlcv[:, 2])
+        & (ohlcv[:, 4] >= 0)
+    )
+    result = result.loc[valid_rows]
+    if result.empty:
+        raise RuntimeError("No complete BTC-USD spot candles are available.")
+
+    if len(result) < 2:
+        raise RuntimeError("At least two complete BTC-USD spot candles are required.")
+    return result
 
 
 def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -24,9 +54,8 @@ def fetch_spot_data() -> pd.DataFrame:
         interval="4h",
         progress=False,
     )
-    df = _flatten_columns(df).dropna()
-    if df.empty:
-        raise RuntimeError("yfinance returned no BTC-USD spot candles.")
+    df = _flatten_columns(df)
+    df = _confirmed_candles(df, "4h")
     print(f"[DATA] Retrieved {len(df)} spot candles.")
     return df
 
@@ -110,9 +139,12 @@ def fetch_derivatives_data(symbol: str = "BTCUSDT") -> dict[str, Any]:
     }
 
 
-def compile_market_context() -> dict[str, Any]:
+def compile_market_context(spot_data: pd.DataFrame | None = None) -> dict[str, Any]:
     print("[DATA] Compiling market context...")
-    spot_data = fetch_spot_data()
+    if spot_data is None:
+        spot_data = fetch_spot_data()
+    if spot_data.empty:
+        raise RuntimeError("Cannot compile market context from empty BTC-USD candles.")
     macro_context = fetch_macro_context()
     derivatives_data = fetch_derivatives_data()
 

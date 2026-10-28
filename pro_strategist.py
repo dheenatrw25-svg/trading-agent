@@ -1,4 +1,5 @@
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,62 @@ YOUR CONFLUENCE RUBRIC:
 - If the DXY is spiking upward, heavily discount bullish Bitcoin setups.
 - Use the exact Volume Profile prices from the data payload for your targets and invalidation levels.
 OUTPUT RESTRICTION: Output YOUR ENTIRE RESPONSE as a single, valid JSON object. No markdown formatting.
+The forecast horizon is the next 4 hours.
 SCHEMA: {"direction": "UP"|"DOWN"|"NEUTRAL"|"WAIT", "target_range_low": float, "target_range_high": float, "invalidation_price": float, "confidence_score": int, "market_regime": "string", "reasoning": "string"}"""
+
+ADVISORY_FIELDS = {
+    "direction",
+    "target_range_low",
+    "target_range_high",
+    "invalidation_price",
+    "confidence_score",
+    "market_regime",
+    "reasoning",
+}
+ADVISORY_DIRECTIONS = {"UP", "DOWN", "NEUTRAL", "WAIT"}
+
+
+def validate_advisory(advisory: object) -> dict[str, Any]:
+    if not isinstance(advisory, dict):
+        raise ValueError("Gemini advisory must be a JSON object.")
+    missing = ADVISORY_FIELDS.difference(advisory)
+    if missing:
+        raise ValueError(
+            "Gemini advisory is missing required fields: "
+            + ", ".join(sorted(missing))
+        )
+    if (
+        not isinstance(advisory["direction"], str)
+        or advisory["direction"] not in ADVISORY_DIRECTIONS
+    ):
+        raise ValueError("Gemini advisory has an unsupported direction.")
+
+    confidence = advisory["confidence_score"]
+    if (
+        isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or not math.isfinite(confidence)
+        or not 1 <= confidence <= 10
+    ):
+        raise ValueError("Gemini confidence_score must be a finite number from 1 to 10.")
+
+    prices = {}
+    for field in ("target_range_low", "target_range_high", "invalidation_price"):
+        value = advisory[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"Gemini advisory field {field} must be a positive number.")
+        prices[field] = float(value)
+    if prices["target_range_low"] > prices["target_range_high"]:
+        raise ValueError("Gemini advisory target low exceeds its target high.")
+    for field in ("market_regime", "reasoning"):
+        if not isinstance(advisory[field], str) or not advisory[field].strip():
+            raise ValueError(f"Gemini advisory field {field} must be a non-empty string.")
+    return advisory
 
 
 def generate_trading_advisory(
@@ -76,7 +132,7 @@ def generate_trading_advisory(
                 time.sleep(5)
 
     try:
-        return json.loads(response.text)
+        return validate_advisory(json.loads(response.text))
     except json.JSONDecodeError as exc:
         print(f"[AI] Gemini returned invalid JSON: {exc}")
         raise ValueError("Gemini response was not valid JSON.") from exc

@@ -1,4 +1,3 @@
-import csv
 import datetime
 from pathlib import Path
 from threading import Lock
@@ -11,51 +10,64 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 import chart_engine
 import data_engine
 import pro_strategist
+from prediction_logs import (
+    APP_LOG_FIELDS,
+    APP_LOG_FILE,
+    append_record,
+    initialize_app_log,
+    to_utc_iso,
+    utc_now,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
 INDEX_FILE = BASE_DIR / "templates" / "index.html"
 CHART_FILE = BASE_DIR / "prediction_chart.png"
-HISTORY_FILE = BASE_DIR / "predictions_log.csv"
-PREDICTION_LOG_FIELDS = [
-    "timestamp",
-    "btc_price_at_prediction",
-    "direction",
-    "target_low",
-    "target_high",
-    "invalidation_price",
-    "confidence",
-    "graded",
-    "actual_outcome",
-    "market_regime",
-    "reasoning",
-]
+HISTORY_FILE = APP_LOG_FILE
+FORECAST_HORIZON_HOURS = 4
 ANALYSIS_LOCK = Lock()
 
 app = FastAPI(title="PRO-TRADER AI", version="1.0.0")
 
 
-def log_prediction(decision_json: dict[str, Any]) -> None:
-    log_file = Path(__file__).resolve().parent / "predictions_log.csv"
+def log_prediction(
+    decision_json: dict[str, Any],
+    market_context: dict[str, Any],
+    spot_data: pd.DataFrame,
+) -> None:
+    decision_json = pro_strategist.validate_advisory(decision_json)
+    if spot_data.empty:
+        raise ValueError("Cannot log a forecast without confirmed BTC candles.")
+    issue_time = utc_now()
+    issue_timestamp = to_utc_iso(issue_time)
+    source_timestamp = pd.Timestamp(spot_data.index[-1])
+    if source_timestamp.tzinfo is None:
+        raise ValueError("Source candle timestamp must include a timezone.")
+    source_timestamp = source_timestamp.tz_convert("UTC")
+    if source_timestamp > pd.Timestamp(issue_time):
+        raise ValueError("Source candle timestamp is later than the forecast issue time.")
     row = {
-        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
-        "btc_price_at_prediction": "",
+        "timestamp": issue_timestamp,
+        "forecast_issue_timestamp": issue_timestamp,
+        "source_candle_timestamp": source_timestamp.isoformat(),
+        "target_timestamp": to_utc_iso(
+            issue_time + datetime.timedelta(hours=FORECAST_HORIZON_HOURS)
+        ),
+        "forecast_horizon_hours": FORECAST_HORIZON_HOURS,
+        "btc_price_at_prediction": market_context["spot"]["current_close"],
         "direction": decision_json["direction"],
         "target_low": decision_json["target_range_low"],
         "target_high": decision_json["target_range_high"],
         "invalidation_price": decision_json["invalidation_price"],
         "confidence": decision_json.get("confidence_score", ""),
         "graded": "False",
+        "actual_price_timestamp": "",
         "actual_outcome": "Pending",
         "market_regime": decision_json.get("market_regime", ""),
         "reasoning": decision_json.get("reasoning", ""),
     }
-    write_headers = not log_file.exists() or log_file.stat().st_size == 0
-    with log_file.open("a", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=PREDICTION_LOG_FIELDS)
-        if write_headers:
-            writer.writeheader()
-        writer.writerow(row)
+    initialize_app_log()
+    append_record(HISTORY_FILE, APP_LOG_FIELDS, row)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -74,8 +86,8 @@ def dashboard() -> HTMLResponse:
 def analyze() -> dict[str, Any] | JSONResponse:
     try:
         with ANALYSIS_LOCK:
-            market_context = data_engine.compile_market_context()
             spot_data = data_engine.fetch_spot_data()
+            market_context = data_engine.compile_market_context(spot_data=spot_data)
             volume_profile = chart_engine.generate_pro_chart(
                 spot_data,
                 filename=str(CHART_FILE),
@@ -88,7 +100,7 @@ def analyze() -> dict[str, Any] | JSONResponse:
                 full_context,
                 chart_image_path=str(CHART_FILE),
             )
-            log_prediction(decision)
+            log_prediction(decision, market_context, spot_data)
             return decision
     except Exception as exc:
         print(f"[API] Analysis failed: {exc}")
@@ -168,9 +180,9 @@ def _history_record(row: dict[str, Any]) -> dict[str, Any]:
 
 @app.get("/api/history", response_model=None)
 def get_history() -> list[dict[str, Any]] | JSONResponse:
-    if not HISTORY_FILE.is_file():
-        return []
     try:
+        if not HISTORY_FILE.is_file():
+            initialize_app_log()
         history = pd.read_csv(HISTORY_FILE)
         if "timestamp" not in history.columns:
             return JSONResponse(

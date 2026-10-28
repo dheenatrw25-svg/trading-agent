@@ -1,6 +1,10 @@
 import os
 import json
 import datetime
+import math
+from pathlib import Path
+
+import numpy as np
 import pandas as pd
 import yfinance as yf
 import mplfinance as mpf
@@ -8,10 +12,74 @@ from PIL import Image
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
+from prediction_logs import (
+    MARKET_LOG_FIELDS,
+    MARKET_LOG_FILE,
+    append_record,
+    initialize_market_log,
+    to_utc_iso,
+    utc_now,
+)
 
 load_dotenv()
 
-LOG_FILE = "predictions_log.csv"
+LOG_FILE = MARKET_LOG_FILE
+FORECAST_HORIZON_HOURS = 2
+ALLOWED_DIRECTIONS = {"BULLISH", "BEARISH", "SIDEWAYS"}
+REQUIRED_PREDICTION_FIELDS = {
+    "predicted_direction",
+    "confidence_score",
+    "expected_high_next_2h",
+    "expected_low_next_2h",
+    "projected_price_in_2h",
+    "predicted_scenario",
+}
+
+
+def validate_prediction(prediction: object) -> dict:
+    if not isinstance(prediction, dict):
+        raise ValueError("Gemini forecast must be a JSON object.")
+    missing = REQUIRED_PREDICTION_FIELDS.difference(prediction)
+    if missing:
+        raise ValueError(
+            "Gemini forecast is missing required fields: "
+            + ", ".join(sorted(missing))
+        )
+
+    direction = prediction["predicted_direction"]
+    if not isinstance(direction, str) or direction not in ALLOWED_DIRECTIONS:
+        raise ValueError("Gemini forecast has an unsupported predicted_direction.")
+    confidence = prediction["confidence_score"]
+    if (
+        isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or not math.isfinite(confidence)
+        or not 1 <= confidence <= 10
+    ):
+        raise ValueError("Gemini confidence_score must be a finite number from 1 to 10.")
+
+    prices = {}
+    for field in (
+        "expected_high_next_2h",
+        "expected_low_next_2h",
+        "projected_price_in_2h",
+    ):
+        value = prediction[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"Gemini forecast field {field} must be a positive number.")
+        prices[field] = float(value)
+    if prices["expected_low_next_2h"] > prices["expected_high_next_2h"]:
+        raise ValueError("Gemini forecast low price exceeds its high price.")
+    if not isinstance(prediction["predicted_scenario"], str) or not prediction[
+        "predicted_scenario"
+    ].strip():
+        raise ValueError("Gemini predicted_scenario must be a non-empty string.")
+    return prediction
 
 # ==========================================
 # 1. CHART GENERATOR (The Eyes)
@@ -20,7 +88,28 @@ def download_clean_df(ticker: str, interval: str, period: str) -> pd.DataFrame:
     df = yf.download(ticker, period=period, interval=interval, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-    return df.dropna()
+    if df.empty:
+        raise RuntimeError(f"No {interval} candle data returned for {ticker}.")
+
+    timestamps = pd.to_datetime(df.index, utc=True, errors="coerce")
+    confirmed = timestamps.notna() & (
+        timestamps + pd.Timedelta(interval) <= pd.Timestamp.now(tz="UTC")
+    )
+    df = df.loc[confirmed].copy()
+    df.index = timestamps[confirmed]
+    df = df.loc[~df.index.duplicated(keep="last")].sort_index()
+    df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+    ohlcv = df[["Open", "High", "Low", "Close", "Volume"]].to_numpy(dtype=float)
+    valid_rows = (
+        np.isfinite(ohlcv).all(axis=1)
+        & (ohlcv[:, :4] > 0).all(axis=1)
+        & (ohlcv[:, 1] >= ohlcv[:, 2])
+        & (ohlcv[:, 4] >= 0)
+    )
+    df = df.loc[valid_rows]
+    if df.empty:
+        raise RuntimeError(f"No complete {interval} candles returned for {ticker}.")
+    return df
 
 def generate_dual_chart(ticker: str = "BTC-USD", output_path: str = "prediction_chart.png"):
     # Macro Trend (1-Hour candles) and Micro Structure (15-Minute candles)
@@ -29,6 +118,11 @@ def generate_dual_chart(ticker: str = "BTC-USD", output_path: str = "prediction_
 
     slice_macro = df_macro.tail(50).copy()
     slice_micro = df_micro.tail(60).copy()
+    if len(slice_macro) < 50 or len(slice_micro) < 50:
+        raise RuntimeError(
+            "At least 50 complete hourly and 15-minute candles are required "
+            "to generate the forecast charts."
+        )
 
     custom_style = mpf.make_mpf_style(
         base_mpf_style='nightclouds',
@@ -66,6 +160,12 @@ def generate_dual_chart(ticker: str = "BTC-USD", output_path: str = "prediction_
 # 2. MATHEMATICAL INDICATORS (The Calculator)
 # ==========================================
 def calculate_metrics(df_micro: pd.DataFrame, df_macro: pd.DataFrame) -> dict:
+    required = {"Close", "High", "Low"}
+    if not required.issubset(df_micro.columns) or "Close" not in df_macro.columns:
+        raise ValueError("Forecast candle data is missing required OHLC columns.")
+    if len(df_micro) < 24 or df_macro.empty:
+        raise ValueError("Insufficient confirmed candle data to calculate metrics.")
+
     close = df_micro['Close']
     high = df_micro['High']
     low = df_micro['Low']
@@ -88,6 +188,8 @@ def calculate_metrics(df_micro: pd.DataFrame, df_macro: pd.DataFrame) -> dict:
     # Macro 50 EMA Trend
     ema50_macro = df_macro['Close'].ewm(span=50, adjust=False).mean()
     current_price = float(close.iloc[-1])
+    if not math.isfinite(current_price) or current_price <= 0:
+        raise ValueError("Latest confirmed BTC price must be finite and positive.")
     macro_bias = "BULLISH" if current_price > float(ema50_macro.iloc[-1]) else "BEARISH"
 
     return {
@@ -96,7 +198,8 @@ def calculate_metrics(df_micro: pd.DataFrame, df_macro: pd.DataFrame) -> dict:
         "rsi_15m": round(float(rsi.iloc[-1]), 2),
         "atr_15m": round(float(atr.iloc[-1]), 2),
         "recent_swing_high": round(float(high.tail(24).max()), 2),
-        "recent_swing_low": round(float(low.tail(24).min()), 2)
+        "recent_swing_low": round(float(low.tail(24).min()), 2),
+        "source_candle_timestamp": pd.Timestamp(df_micro.index[-1]).isoformat(),
     }
 
 # ==========================================
@@ -142,29 +245,63 @@ def predict_next_2_hours(image_path: str, metrics: dict, ticker: str) -> dict:
         )
     )
 
-    return json.loads(response.text)
+    try:
+        return validate_prediction(json.loads(response.text))
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("Gemini response was not a valid JSON forecast.") from exc
 
 # ==========================================
 # 4. LOGGING & EXECUTION
 # ==========================================
-def log_prediction(ticker: str, metrics: dict, prediction: dict):
+def log_prediction(
+    ticker: str,
+    metrics: dict,
+    prediction: dict,
+    log_file: Path = LOG_FILE,
+    issued_at: datetime.datetime | None = None,
+) -> None:
+    prediction = validate_prediction(prediction)
+    issue_time = issued_at or utc_now()
+    issue_timestamp = to_utc_iso(issue_time)
+    source_timestamp = pd.Timestamp(metrics["source_candle_timestamp"])
+    if source_timestamp.tzinfo is None:
+        raise ValueError("Source candle timestamp must include a timezone.")
+    source_timestamp = source_timestamp.tz_convert("UTC")
+    if source_timestamp > pd.Timestamp(issue_time):
+        raise ValueError("Source candle timestamp is later than the forecast issue time.")
+    starting_price = metrics["current_price"]
+    if (
+        isinstance(starting_price, bool)
+        or not isinstance(starting_price, (int, float))
+        or not math.isfinite(starting_price)
+        or starting_price <= 0
+    ):
+        raise ValueError("Starting BTC price must be finite and positive.")
+
     record = {
-        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": issue_timestamp,
+        "forecast_issue_timestamp": issue_timestamp,
+        "source_candle_timestamp": source_timestamp.isoformat(),
+        "target_timestamp": to_utc_iso(
+            issue_time + datetime.timedelta(hours=FORECAST_HORIZON_HOURS)
+        ),
+        "forecast_horizon_hours": FORECAST_HORIZON_HOURS,
         "ticker": ticker,
-        "current_price": metrics["current_price"],
+        "starting_btc_price": starting_price,
         "predicted_direction": prediction.get("predicted_direction"),
         "confidence_score": prediction.get("confidence_score"),
         "expected_low_2h": prediction.get("expected_low_next_2h"),
         "expected_high_2h": prediction.get("expected_high_next_2h"),
         "projected_price_2h": prediction.get("projected_price_in_2h"),
-        "scenario": prediction.get("predicted_scenario")
+        "scenario": prediction.get("predicted_scenario"),
+        "graded": "False",
+        "actual_price": "",
+        "actual_price_timestamp": "",
+        "actual_outcome": "Pending",
     }
 
-    df = pd.DataFrame([record])
-    if not os.path.exists(LOG_FILE):
-        df.to_csv(LOG_FILE, index=False)
-    else:
-        df.to_csv(LOG_FILE, mode="a", header=False, index=False)
+    initialize_market_log(log_file)
+    append_record(log_file, MARKET_LOG_FIELDS, record)
 
 def run_predictor(ticker: str = "BTC-USD"):
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 1. Generating charts for {ticker}...")
@@ -175,6 +312,7 @@ def run_predictor(ticker: str = "BTC-USD"):
 
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 3. Asking Gemini for 2-hour prediction...")
     prediction = predict_next_2_hours(chart_path, metrics, ticker)
+    prediction = validate_prediction(prediction)
 
     print("\n================ 2-HOUR MARKET FORECAST ================")
     print(f"Asset:               {ticker}")

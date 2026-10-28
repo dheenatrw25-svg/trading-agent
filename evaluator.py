@@ -1,16 +1,38 @@
 import datetime
 import math
+from pathlib import Path
 from typing import Any
 
 import chromadb
 import pandas as pd
 import yfinance as yf
 
+from prediction_logs import (
+    APP_LOG_FILE,
+    MARKET_LOG_FILE,
+    initialize_app_log,
+    initialize_market_log,
+)
 
 CHROMA_CLIENT = chromadb.PersistentClient(path="chroma_db")
 TRADE_MEMORIES = CHROMA_CLIENT.get_or_create_collection(name="trade_memories")
-CSV_COLUMNS = {
-    "timestamp",
+MARKET_COLUMNS = {
+    "forecast_issue_timestamp",
+    "source_candle_timestamp",
+    "target_timestamp",
+    "forecast_horizon_hours",
+    "starting_btc_price",
+    "predicted_direction",
+    "expected_low_2h",
+    "expected_high_2h",
+    "graded",
+    "actual_outcome",
+}
+APP_COLUMNS = {
+    "forecast_issue_timestamp",
+    "source_candle_timestamp",
+    "target_timestamp",
+    "forecast_horizon_hours",
     "direction",
     "target_low",
     "target_high",
@@ -28,14 +50,14 @@ def _utc_timestamp(value: Any) -> pd.Timestamp:
     return timestamp.tz_convert("UTC")
 
 
-def _fetch_price_at(target_time: pd.Timestamp) -> float:
-    start = target_time - pd.Timedelta(hours=2)
-    end = target_time + pd.Timedelta(hours=2)
+def _fetch_price_at(target_time: pd.Timestamp) -> tuple[float, pd.Timestamp]:
+    start = target_time - pd.Timedelta(minutes=2)
+    end = target_time + pd.Timedelta(minutes=1)
     history = yf.download(
         "BTC-USD",
         start=start.to_pydatetime(),
         end=end.to_pydatetime(),
-        interval="1h",
+        interval="1m",
         progress=False,
         auto_adjust=False,
     )
@@ -45,20 +67,26 @@ def _fetch_price_at(target_time: pd.Timestamp) -> float:
     if history.empty:
         raise RuntimeError(f"No BTC-USD historical price returned near {target_time}.")
 
-    index_utc = pd.to_datetime(history.index, utc=True)
-    candle_close_times = index_utc + pd.Timedelta(hours=1)
-    distances = candle_close_times - target_time
-    nearest_position = int(distances.to_series().abs().argmin())
-    if abs(distances[nearest_position]) > pd.Timedelta(hours=1):
+    index_utc = pd.to_datetime(history.index, utc=True, errors="coerce")
+    candle_close_times = index_utc + pd.Timedelta(minutes=1)
+    eligible = candle_close_times.notna() & (candle_close_times <= target_time)
+    eligible_positions = [position for position, is_valid in enumerate(eligible) if is_valid]
+    if not eligible_positions:
         raise RuntimeError(
-            f"No BTC-USD hourly candle close enough to {target_time} "
-            "to grade this prediction."
+            f"No completed BTC-USD one-minute candle is available at {target_time}."
+        )
+    nearest_position = max(eligible_positions, key=lambda position: candle_close_times[position])
+    price_timestamp = candle_close_times[nearest_position]
+    if target_time - price_timestamp > pd.Timedelta(minutes=1):
+        raise RuntimeError(
+            f"No BTC-USD candle close within one minute before {target_time}; "
+            "the forecast remains pending."
         )
 
     price = float(history["Close"].iloc[nearest_position])
-    if not math.isfinite(price):
+    if not math.isfinite(price) or price <= 0:
         raise RuntimeError(f"Historical BTC-USD price at {target_time} is not finite.")
-    return price
+    return price, price_timestamp
 
 
 def _grade_outcome(row: pd.Series, actual_price: float) -> str:
@@ -80,14 +108,49 @@ def _grade_outcome(row: pd.Series, actual_price: float) -> str:
     return "Neutral"
 
 
+def _grade_market_outcome(row: pd.Series, actual_price: float) -> str:
+    direction = str(row["predicted_direction"]).strip().upper()
+    starting_price = float(row["starting_btc_price"])
+
+    if direction == "BULLISH":
+        if actual_price > starting_price:
+            return "Win"
+        return "Loss" if actual_price < starting_price else "Neutral"
+    if direction == "BEARISH":
+        if actual_price < starting_price:
+            return "Win"
+        return "Loss" if actual_price > starting_price else "Neutral"
+    if direction == "SIDEWAYS":
+        target_low = float(row["expected_low_2h"])
+        target_high = float(row["expected_high_2h"])
+        return "Win" if target_low <= actual_price <= target_high else "Loss"
+    raise ValueError(f"Unsupported 2-hour forecast direction: {direction}.")
+
+
+def _validate_forecast_timestamps(row: pd.Series, expected_horizon: int) -> pd.Timestamp:
+    issue_time = _utc_timestamp(row["forecast_issue_timestamp"])
+    source_time = _utc_timestamp(row["source_candle_timestamp"])
+    target_time = _utc_timestamp(row["target_timestamp"])
+    horizon = float(row["forecast_horizon_hours"])
+    if horizon != expected_horizon:
+        raise ValueError(
+            f"Expected a {expected_horizon}-hour forecast, found {horizon:g} hours."
+        )
+    if source_time > issue_time:
+        raise ValueError("Source candle timestamp is later than the forecast issue time.")
+    if target_time != issue_time + pd.Timedelta(hours=expected_horizon):
+        raise ValueError("Target timestamp does not match the recorded forecast horizon.")
+    return target_time
+
+
 def store_memory(row_data: dict[str, Any]) -> None:
     timestamp = str(row_data.get("timestamp", ""))
     if not timestamp:
         raise ValueError("Cannot store a trade memory without a timestamp.")
 
-    direction = row_data.get("direction", "Unknown")
-    target_low = row_data.get("target_low", "Unknown")
-    target_high = row_data.get("target_high", "Unknown")
+    direction = row_data.get("direction") or row_data.get("predicted_direction", "Unknown")
+    target_low = row_data.get("target_low") or row_data.get("expected_low_2h", "Unknown")
+    target_high = row_data.get("target_high") or row_data.get("expected_high_2h", "Unknown")
     reasoning = row_data.get("reasoning") or row_data.get("scenario") or "Not recorded."
     market_regime = row_data.get("market_regime") or "Not recorded."
     outcome = row_data.get("actual_outcome", "Unknown")
@@ -126,24 +189,22 @@ def retrieve_past_lessons(current_market_regime: str) -> str:
 
 
 def grade_pending_predictions(
-    csv_file: str = "predictions_log.csv",
+    csv_file: str | Path = MARKET_LOG_FILE,
 ) -> dict[str, int]:
+    csv_file = Path(csv_file)
+    if csv_file == MARKET_LOG_FILE:
+        initialize_market_log()
+    elif csv_file == APP_LOG_FILE:
+        initialize_app_log()
+    if not csv_file.is_file():
+        return {"graded": 0, "memorized": 0, "errors": 0, "pending": 0}
+
     predictions = pd.read_csv(csv_file)
-    missing_columns = CSV_COLUMNS.difference(predictions.columns)
+    market_log = "predicted_direction" in predictions.columns
+    required_columns = MARKET_COLUMNS if market_log else APP_COLUMNS
+    expected_horizon = 2 if market_log else 4
+    missing_columns = required_columns.difference(predictions.columns)
     if missing_columns:
-        legacy_columns = {
-            "timestamp",
-            "predicted_direction",
-            "expected_low_2h",
-            "expected_high_2h",
-            "scenario",
-        }
-        if legacy_columns.issubset(predictions.columns):
-            print(
-                "[EVALUATOR] Skipping legacy 2-hour forecast log; "
-                "it has no 4-hour grading status."
-            )
-            return {"graded": 0, "memorized": 0, "errors": 0, "pending": 0}
         raise ValueError(
             "Prediction CSV is missing required columns: "
             + ", ".join(sorted(missing_columns))
@@ -152,28 +213,40 @@ def grade_pending_predictions(
     now_utc = pd.Timestamp.now(tz="UTC")
     pending_mask = predictions["graded"].astype(str).str.strip().str.casefold().eq("false")
     summary = {"graded": 0, "memorized": 0, "errors": 0, "pending": 0}
-    predictions["graded"] = predictions["graded"].astype(object)
+    for column in ("graded", "actual_price_timestamp", "actual_outcome"):
+        if column in predictions.columns:
+            predictions[column] = predictions[column].astype(object)
 
     for index in predictions.index[pending_mask]:
         row = predictions.loc[index]
         try:
-            prediction_time = _utc_timestamp(row["timestamp"])
-            target_time = prediction_time + pd.Timedelta(hours=4)
-            if now_utc - prediction_time < pd.Timedelta(hours=4):
+            target_time = _validate_forecast_timestamps(row, expected_horizon)
+            if not str(row["source_candle_timestamp"]).strip():
+                raise ValueError("Source candle timestamp is missing.")
+            if now_utc < target_time:
                 continue
-            actual_price = _fetch_price_at(target_time)
-            outcome = _grade_outcome(row, actual_price)
+            actual_price, price_timestamp = _fetch_price_at(target_time)
+            outcome = (
+                _grade_market_outcome(row, actual_price)
+                if market_log
+                else _grade_outcome(row, actual_price)
+            )
             row_data = row.to_dict()
             row_data["actual_price"] = actual_price
+            row_data["actual_price_timestamp"] = price_timestamp.isoformat()
             row_data["actual_outcome"] = outcome
             store_memory(row_data)
             predictions.at[index, "graded"] = "True"
+            if "actual_price" in predictions.columns:
+                predictions.at[index, "actual_price"] = actual_price
+            if "actual_price_timestamp" in predictions.columns:
+                predictions.at[index, "actual_price_timestamp"] = price_timestamp.isoformat()
             predictions.at[index, "actual_outcome"] = outcome
             summary["graded"] += 1
             summary["memorized"] += 1
             print(
                 f"[EVALUATOR] {row['timestamp']} graded {outcome} "
-                f"(actual BTC close: {actual_price:.2f})."
+                f"(actual BTC close: {actual_price:.2f} at {price_timestamp})."
             )
         except Exception as exc:
             summary["errors"] += 1
@@ -187,10 +260,19 @@ def grade_pending_predictions(
     return summary
 
 
+def grade_app_pending_predictions(
+    csv_file: str | Path = APP_LOG_FILE,
+) -> dict[str, int]:
+    return grade_pending_predictions(csv_file)
+
+
 if __name__ == "__main__":
-    result = grade_pending_predictions()
-    print(
-        "[EVALUATOR] Summary: "
-        f"{result['graded']} graded, {result['memorized']} memorized, "
-        f"{result['pending']} pending, {result['errors']} errors."
-    )
+    for label, result in (
+        ("2-hour market forecasts", grade_pending_predictions()),
+        ("4-hour app forecasts", grade_app_pending_predictions()),
+    ):
+        print(
+            f"[EVALUATOR] {label}: "
+            f"{result['graded']} graded, {result['memorized']} memorized, "
+            f"{result['pending']} pending, {result['errors']} errors."
+        )
