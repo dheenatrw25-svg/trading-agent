@@ -17,16 +17,18 @@ load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 
 PRO_TRADER_PROMPT = """You are an elite institutional quantitative cryptocurrency analyst. Your objective is to provide highly accurate, probabilistic market forecasts with strict risk management.
 You have two inputs:
-1. A visual chart displaying price action and institutional Volume Profile levels (Yellow = Point of Control, Cyan = Value Area High/Low).
-2. A JSON payload containing exact spot prices, derivatives positioning (Open Interest, Funding Rates), and Macro conditions (DXY).
+1. A visual chart displaying price action and OHLCV-based Volume Profile levels (Yellow = Point of Control, Cyan = Value Area High/Low).
+2. A JSON payload containing exact spot prices, up to 20 timestamped completed four-hour candles, volume comparisons, actual recent swing levels, derivatives positioning (Open Interest, Funding Rates), and macro conditions (DXY).
+3. The four-hour trading playbook. Apply its rules, thresholds, evidence requirements, and risk/reward test.
 YOUR CONFLUENCE RUBRIC:
-- Compare visual market structure against derivatives data. If price is rising but Open Interest is dropping, flag it as a low-volume short squeeze.
-- If Funding Rates are highly elevated, be cautious of a long flush.
-- If the DXY is spiking upward, heavily discount bullish Bitcoin setups.
-- Use the exact Volume Profile prices from the data payload for your targets and invalidation levels.
+- Treat the advisory as a directional forecast, not an instruction to buy or sell and not an automatic trading system.
+- The direction MUST be exactly UP or DOWN. When evidence is unclear or contradictory, choose the best-supported direction, normally use confidence 4/10 or lower when no meaningful edge exists, and explicitly state that this is not an actionable setup.
+- Use only completed four-hour candles; a wick alone does not confirm breakout, reclaim, or rejection.
+- Apply the supplied macro, volume, funding, open-interest, setup, and reward/risk rules. Do not infer open-interest change from a single snapshot or fabricate unavailable data.
+- Every target, invalidation, swing, and liquidity level must come from the supplied volume profile or actual candle data. Do not invent price levels.
 OUTPUT RESTRICTION: Output YOUR ENTIRE RESPONSE as a single, valid JSON object. No markdown formatting.
 The forecast horizon is the next 4 hours.
-SCHEMA: {"direction": "UP"|"DOWN"|"NEUTRAL"|"WAIT", "target_range_low": float, "target_range_high": float, "invalidation_price": float, "confidence_score": int, "market_regime": "string", "reasoning": "string"}"""
+SCHEMA: {"direction": "UP"|"DOWN", "target_range_low": float, "target_range_high": float, "invalidation_price": float, "confidence_score": int, "market_regime": "string", "reasoning": "string"}"""
 
 ADVISORY_FIELDS = {
     "direction",
@@ -37,7 +39,196 @@ ADVISORY_FIELDS = {
     "market_regime",
     "reasoning",
 }
-ADVISORY_DIRECTIONS = {"UP", "DOWN", "NEUTRAL", "WAIT"}
+ADVISORY_DIRECTIONS = {"UP", "DOWN"}
+
+
+def load_playbook() -> str:
+    playbook_path = PROJECT_ROOT / "trading_playbook.md"
+    try:
+        playbook = playbook_path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Trading playbook is required but was not found: {playbook_path}"
+        ) from exc
+    except OSError as exc:
+        raise OSError(f"Could not read trading playbook at {playbook_path}: {exc}") from exc
+    if not playbook.strip():
+        raise ValueError(f"Trading playbook is empty: {playbook_path}")
+    return playbook
+
+
+def calculate_risk_reward(
+    current_price: object,
+    direction: str,
+    target_range_low: object,
+    target_range_high: object,
+    invalidation_price: object,
+) -> dict[str, Any]:
+    values = {
+        "current_price": current_price,
+        "target_range_low": target_range_low,
+        "target_range_high": target_range_high,
+        "invalidation_price": invalidation_price,
+    }
+    parsed: dict[str, float] = {}
+    for name, value in values.items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            return {
+                "actionable": False,
+                "risk": None,
+                "reward": None,
+                "risk_reward_ratio": None,
+                "reason": f"{name} is unavailable or invalid.",
+            }
+        parsed[name] = float(value)
+    if direction not in ADVISORY_DIRECTIONS:
+        raise ValueError("Risk/reward direction must be UP or DOWN.")
+    if parsed["target_range_low"] > parsed["target_range_high"]:
+        return {
+            "actionable": False,
+            "risk": None,
+            "reward": None,
+            "risk_reward_ratio": None,
+            "reason": "Target range is inverted.",
+        }
+
+    entry = parsed["current_price"]
+    target_midpoint = (
+        parsed["target_range_low"] + parsed["target_range_high"]
+    ) / 2
+    if direction == "UP":
+        risk = entry - parsed["invalidation_price"]
+        reward = target_midpoint - entry
+    else:
+        risk = parsed["invalidation_price"] - entry
+        reward = entry - target_midpoint
+
+    if risk <= 0 or reward <= 0:
+        return {
+            "actionable": False,
+            "risk": risk,
+            "reward": reward,
+            "risk_reward_ratio": None,
+            "reason": "Target midpoint and invalidation must be on the correct sides of current price.",
+        }
+    ratio = reward / risk
+    return {
+        "actionable": ratio >= 1.5,
+        "risk": risk,
+        "reward": reward,
+        "risk_reward_ratio": ratio,
+        "reason": (
+            "Reward/risk meets the 1.5 minimum."
+            if ratio >= 1.5
+            else "Reward/risk is below the 1.5 minimum."
+        ),
+    }
+
+
+def _apply_python_strategy_checks(
+    advisory: dict[str, Any],
+    market_context: dict[str, Any],
+) -> dict[str, Any]:
+    result = dict(advisory)
+    direction = result["direction"]
+    confidence = int(result["confidence_score"])
+    macro = market_context.get("macro", {})
+    derivatives = market_context.get("derivatives", {})
+    current_price = market_context.get("spot", {}).get("current_close")
+    limitations: list[str] = []
+
+    try:
+        dxy_change = float(macro["dxy_daily_change_pct"])
+    except (KeyError, TypeError, ValueError):
+        dxy_change = math.nan
+    if math.isfinite(dxy_change) and dxy_change >= 0.40 and direction == "UP":
+        confidence = min(confidence, 5)
+        limitations.append(
+            "Strong-dollar headwind (DXY daily change at or above +0.40%) caps UP confidence at 5/10."
+        )
+    elif not math.isfinite(dxy_change):
+        limitations.append(
+            "DXY daily change is unavailable, so the macro filter could not be evaluated."
+        )
+
+    try:
+        annualized_funding = float(derivatives["annualized_funding_rate_pct"])
+    except (KeyError, TypeError, ValueError):
+        annualized_funding = math.nan
+    if (
+        math.isfinite(annualized_funding)
+        and annualized_funding > 25
+        and direction == "UP"
+    ):
+        confidence = max(1, confidence - 2)
+        limitations.append(
+            "Crowded-long warning: annualized funding exceeds 25%; UP confidence reduced by at least two points."
+        )
+    elif not math.isfinite(annualized_funding):
+        limitations.append(
+            "Binance annualized funding is unavailable, so positioning could not be fully evaluated."
+        )
+
+    price_action = market_context.get("price_action")
+    if not isinstance(price_action, dict):
+        confidence = min(confidence, 4)
+        limitations.append(
+            "Completed four-hour candle and volume context is unavailable; this is not an actionable setup."
+        )
+    else:
+        volume_comparison = price_action.get("volume_comparison", {})
+        if (
+            not isinstance(volume_comparison, dict)
+            or volume_comparison.get("volume_state") == "unavailable"
+        ):
+            confidence = min(confidence, 4)
+            limitations.append(
+                "A reliable recent-volume comparison is unavailable; do not treat volume expansion or flatness as confirmed. This is not an actionable setup."
+            )
+
+    if derivatives.get("open_interest_trend") not in {"rising", "falling", "stagnant"}:
+        limitations.append(
+            "Historical open-interest trend is unavailable; the current snapshot is not treated as evidence of a trend."
+        )
+
+    if not isinstance(current_price, (int, float)) or isinstance(current_price, bool):
+        risk_reward = calculate_risk_reward(
+            None,
+            direction,
+            result["target_range_low"],
+            result["target_range_high"],
+            result["invalidation_price"],
+        )
+    else:
+        risk_reward = calculate_risk_reward(
+            current_price,
+            direction,
+            result["target_range_low"],
+            result["target_range_high"],
+            result["invalidation_price"],
+        )
+    if not risk_reward["actionable"]:
+        confidence = min(confidence, 4)
+        ratio = risk_reward["risk_reward_ratio"]
+        rr_text = (
+            f"Calculated reward/risk is {ratio:.2f}:1, below the required 1.5:1."
+            if isinstance(ratio, (int, float))
+            else f"Risk/reward could not be established: {risk_reward['reason']}"
+        )
+        limitations.append(f"{rr_text} This is not an actionable setup.")
+    result["confidence_score"] = confidence
+    if limitations:
+        result["reasoning"] = (
+            result["reasoning"].rstrip()
+            + " "
+            + " ".join(limitations)
+        )
+    return validate_advisory(result)
 
 
 def validate_advisory(advisory: object) -> dict[str, Any]:
@@ -92,12 +283,14 @@ def generate_trading_advisory(
         raise FileNotFoundError(f"Chart image not found: {image_path}")
 
     data_string = json.dumps(market_context, indent=2)
+    playbook = load_playbook()
     regime_context = market_context.get("market_regime")
     if not isinstance(regime_context, str) or not regime_context.strip():
         regime_context = json.dumps(
             {
                 "macro": market_context.get("macro", {}),
                 "derivatives": market_context.get("derivatives", {}),
+                "price_action": market_context.get("price_action", {}),
                 "volume_profile": market_context.get("volume_profile", {}),
             },
             sort_keys=True,
@@ -112,6 +305,7 @@ def generate_trading_advisory(
                     model="gemini-3.8-flash",
                     contents=[
                         PRO_TRADER_PROMPT,
+                        f"Four-hour trading playbook:\n{playbook}",
                         data_string,
                         f"Relevant lessons from past trades:\n{past_lessons}",
                         chart_image,
@@ -134,7 +328,8 @@ def generate_trading_advisory(
                 time.sleep(5)
 
     try:
-        return validate_advisory(json.loads(response.text))
+        advisory = validate_advisory(json.loads(response.text))
+        return _apply_python_strategy_checks(advisory, market_context)
     except json.JSONDecodeError as exc:
         print(f"[AI] Gemini returned invalid JSON: {exc}")
         raise ValueError("Gemini response was not valid JSON.") from exc
