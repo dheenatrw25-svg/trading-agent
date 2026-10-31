@@ -9,6 +9,7 @@ from .prediction_logs import (
     ADVISORY_LOG_FIELDS,
     ADVISORY_LOG_FILE,
     append_record,
+    append_forecast_result,
     initialize_advisory_log,
     to_utc_iso,
     utc_now,
@@ -82,6 +83,18 @@ def run_agent_pipeline() -> None:
             "reasoning": advisory["reasoning"],
         }
         append_record(ADVISORY_LOG_FILE, ADVISORY_LOG_FIELDS, row)
+        result_row = {
+            **row,
+            "target_price": advisory["target_price"],
+            "setup_actionable": pro_strategist.calculate_risk_reward(
+                btc_price,
+                advisory["direction"],
+                advisory["target_range_low"],
+                advisory["target_range_high"],
+                advisory["invalidation_price"],
+            )["actionable"],
+        }
+        append_forecast_result(result_row, FORECAST_HORIZON_HOURS)
         print(f"[GATEKEEPER] Advisory logged to {CSV_FILENAME}.")
     except Exception as exc:
         print(f"[GATEKEEPER] Pipeline failed: {exc}")

@@ -33,12 +33,13 @@ YOUR CONFLUENCE RUBRIC:
 - Every target, invalidation, swing, and liquidity level must come from the supplied volume profile or actual candle data. Do not invent price levels.
 OUTPUT RESTRICTION: Output YOUR ENTIRE RESPONSE as a single, valid JSON object. No markdown formatting.
 The forecast horizon is the next 4 hours.
-SCHEMA: {"direction": "UP"|"DOWN", "target_range_low": float, "target_range_high": float, "invalidation_price": float, "confidence_score": int, "market_regime": "string", "reasoning": "string"}"""
+SCHEMA: {"direction": "UP"|"DOWN", "target_range_low": float, "target_range_high": float, "target_price": float, "invalidation_price": float, "confidence_score": int, "market_regime": "string", "reasoning": "string"}"""
 
 ADVISORY_FIELDS = {
     "direction",
     "target_range_low",
     "target_range_high",
+    "target_price",
     "invalidation_price",
     "confidence_score",
     "market_regime",
@@ -261,7 +262,12 @@ def validate_advisory(advisory: object) -> dict[str, Any]:
         raise ValueError("Gemini confidence_score must be a finite number from 1 to 10.")
 
     prices = {}
-    for field in ("target_range_low", "target_range_high", "invalidation_price"):
+    for field in (
+        "target_range_low",
+        "target_range_high",
+        "target_price",
+        "invalidation_price",
+    ):
         value = advisory[field]
         if (
             isinstance(value, bool)
@@ -273,6 +279,8 @@ def validate_advisory(advisory: object) -> dict[str, Any]:
         prices[field] = float(value)
     if prices["target_range_low"] > prices["target_range_high"]:
         raise ValueError("Gemini advisory target low exceeds its target high.")
+    if not prices["target_range_low"] <= prices["target_price"] <= prices["target_range_high"]:
+        raise ValueError("Gemini advisory target_price must fall within its target range.")
     for field in ("market_regime", "reasoning"):
         if not isinstance(advisory[field], str) or not advisory[field].strip():
             raise ValueError(f"Gemini advisory field {field} must be a non-empty string.")

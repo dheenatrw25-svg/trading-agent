@@ -233,20 +233,25 @@ class ForecastLoggingAndEvaluationTests(unittest.TestCase):
             "current_price": 100.0,
             "source_candle_timestamp": "2026-01-01T11:45:00+00:00",
         }
-        market_predictor.log_prediction(
-            "BTC-USD",
-            metrics,
-            valid_market_forecast(),
-            log_file=log_file,
-            issued_at=issue_time,
-        )
-        market_predictor.log_prediction(
-            "BTC-USD",
-            metrics,
-            valid_market_forecast(),
-            log_file=log_file,
-            issued_at=issue_time,
-        )
+        unified_file = self.directory / "forecast_results.csv"
+        with (
+            patch.object(prediction_logs, "FORECAST_RESULTS_FILE", unified_file),
+            patch.object(prediction_logs, "_migration_result_sources", return_value=[]),
+        ):
+            market_predictor.log_prediction(
+                "BTC-USD",
+                metrics,
+                valid_market_forecast(),
+                log_file=log_file,
+                issued_at=issue_time,
+            )
+            market_predictor.log_prediction(
+                "BTC-USD",
+                metrics,
+                valid_market_forecast(),
+                log_file=log_file,
+                issued_at=issue_time,
+            )
         with log_file.open(newline="", encoding="utf-8") as file:
             reader = csv.DictReader(file)
             rows = list(reader)
@@ -261,6 +266,22 @@ class ForecastLoggingAndEvaluationTests(unittest.TestCase):
         self.assertEqual(rows[0]["forecast_horizon_hours"], "2")
         self.assertEqual(rows[0]["evaluation_status"], "PENDING")
         self.assertEqual(rows[0]["scenario"], valid_market_forecast()["predicted_scenario"])
+        with unified_file.open(newline="", encoding="utf-8") as file:
+            unified_reader = csv.DictReader(file)
+            unified_rows = list(unified_reader)
+            self.assertEqual(
+                unified_reader.fieldnames,
+                prediction_logs.FORECAST_RESULTS_FIELDS,
+            )
+        self.assertEqual(len(unified_rows), 1)
+        self.assertEqual(unified_rows[0]["Forecast Hours"], "2")
+        self.assertEqual(
+            unified_rows[0]["Analysed Time (IST)"], "2026-01-01 17:30:00 IST"
+        )
+        self.assertEqual(
+            unified_rows[0]["Target Price Time (IST)"], "2026-01-01 19:30:00 IST"
+        )
+        self.assertEqual(unified_rows[0]["UP / DOWN / WAIT"], "UP")
 
     def test_source_candle_timestamp_records_the_candle_close(self) -> None:
         index = pd.date_range(
@@ -329,12 +350,20 @@ class ForecastLoggingAndEvaluationTests(unittest.TestCase):
             "direction": "UP",
             "target_range_low": 95.0,
             "target_range_high": 110.0,
+            "target_price": 105.0,
             "invalidation_price": 90.0,
             "confidence_score": 7,
             "market_regime": "Ranging",
             "reasoning": "Dashboard advisory test.",
         }
-        with patch.object(app, "HISTORY_FILE", advisory_file):
+        results_file = self.directory / "forecast_results.csv"
+        issue_time = datetime.datetime(2026, 1, 1, 12, 0, tzinfo=datetime.timezone.utc)
+        with (
+            patch.object(app, "HISTORY_FILE", advisory_file),
+            patch.object(app, "RESULTS_FILE", results_file),
+            patch.object(app, "utc_now", return_value=issue_time),
+            patch.object(prediction_logs, "_migration_result_sources", return_value=[]),
+        ):
             app.log_prediction(decision, {"spot": {"current_close": 100.0}}, spot_data)
         with advisory_file.open(newline="", encoding="utf-8") as file:
             reader = csv.DictReader(file)
@@ -343,6 +372,152 @@ class ForecastLoggingAndEvaluationTests(unittest.TestCase):
         self.assertEqual(row["direction"], "UP")
         self.assertEqual(row["forecast_horizon_hours"], "4")
         self.assertEqual(row["reasoning"], "Dashboard advisory test.")
+        with results_file.open(newline="", encoding="utf-8") as file:
+            results = list(csv.DictReader(file))
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["Forecast Hours"], "4")
+        self.assertEqual(
+            results[0]["Analysed Time (IST)"], "2026-01-01 17:30:00 IST"
+        )
+        self.assertEqual(
+            results[0]["Target Price Time (IST)"], "2026-01-01 21:30:00 IST"
+        )
+        self.assertEqual(results[0]["Exact Target Price"], "$105.00")
+        self.assertEqual(results[0]["UP / DOWN / WAIT"], "WAIT")
+
+    def test_unified_migration_deduplicates_and_keeps_unrecoverable_values_blank(self) -> None:
+        logs = self.directory / "logs"
+        logs.mkdir()
+        legacy_market = logs / "market.csv"
+        legacy_advisory = logs / "advisory.csv"
+        market_row = {
+            "timestamp": "2026-01-01T12:00:00+00:00",
+            "forecast_issue_timestamp": "2026-01-01T12:00:00+00:00",
+            "source_candle_timestamp": "",
+            "target_timestamp": "",
+            "forecast_horizon_hours": "2",
+            "ticker": "BTC-USD",
+            "starting_btc_price": "100",
+            "predicted_direction": "SIDEWAYS",
+            "confidence_score": "7",
+            "expected_low_2h": "90",
+            "expected_high_2h": "110",
+            "projected_price_2h": "100",
+            "scenario": "Historical 2H forecast",
+            "graded": "Legacy",
+            "actual_price": "",
+            "actual_price_timestamp": "",
+            "actual_outcome": "",
+        }
+        with legacy_market.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=prediction_logs.LEGACY_MARKET_FIELDS)
+            writer.writeheader()
+            writer.writerow(market_row)
+            writer.writerow(market_row)
+        advisory_row = {
+            "timestamp": "2026-01-01 13:00:00",
+            "forecast_issue_timestamp": "",
+            "source_candle_timestamp": "",
+            "target_timestamp": "",
+            "forecast_horizon_hours": "4",
+            "btc_price_at_prediction": "100",
+            "direction": "UP",
+            "target_low": "105",
+            "target_high": "120",
+            "invalidation_price": "90",
+            "confidence": "4",
+            "graded": "Legacy",
+            "actual_price_timestamp": "",
+            "actual_outcome": "",
+            "market_regime": "",
+            "reasoning": "Historical advisory",
+        }
+        with legacy_advisory.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=prediction_logs.APP_LOG_FIELDS)
+            writer.writeheader()
+            writer.writerow(advisory_row)
+        legacy_shared = logs / "shared.csv"
+        with legacy_shared.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(prediction_logs.LEGACY_APP_FIELDS)
+            writer.writerow(
+                [
+                    "2026-01-02T12:00:00+00:00",
+                    "BTC-USD",
+                    "101",
+                    "BULLISH",
+                    "6",
+                    "90",
+                    "110",
+                    "105",
+                    "Recovered shared market forecast",
+                ]
+            )
+
+        results_file = logs / "forecast_results.csv"
+        with (
+            patch.object(prediction_logs, "FORECAST_RESULTS_FILE", results_file),
+            patch.object(prediction_logs, "BTC_FORECAST_FILE", logs / "missing-btc.csv"),
+            patch.object(prediction_logs, "ADVISORY_LOG_FILE", logs / "missing-app.csv"),
+            patch.object(prediction_logs, "LEGACY_MARKET_LOG_FILE", legacy_market),
+            patch.object(prediction_logs, "LEGACY_APP_LOG_FILE", legacy_advisory),
+            patch.object(prediction_logs, "LEGACY_SHARED_LOG_FILE", legacy_shared),
+        ):
+            prediction_logs.initialize_forecast_results_log()
+            prediction_logs.initialize_forecast_results_log()
+        with results_file.open(newline="", encoding="utf-8") as file:
+            rows = list(csv.DictReader(file))
+        self.assertEqual(len(rows), 3)
+        market_result = next(row for row in rows if row["Forecast Hours"] == "2")
+        self.assertEqual(market_result["UP / DOWN / WAIT"], "WAIT")
+        self.assertEqual(market_result["Target Price Time (IST)"], "2026-01-01 19:30:00 IST")
+        advisory_result = next(row for row in rows if row["Forecast Hours"] == "4")
+        self.assertEqual(advisory_result["Analysed Time (IST)"], "")
+        self.assertEqual(advisory_result["Target Price Time (IST)"], "")
+        self.assertEqual(advisory_result["Exact Target Price"], "")
+        self.assertEqual(advisory_result["UP / DOWN / WAIT"], "WAIT")
+        recovered_result = next(
+            row for row in rows if row["Reason"] == "Recovered shared market forecast"
+        )
+        self.assertEqual(recovered_result["Forecast Hours"], "2")
+        self.assertEqual(recovered_result["Current Price"], "$101.00")
+        self.assertEqual(recovered_result["Target Price Time (IST)"], "2026-01-02 19:30:00 IST")
+
+    def test_history_api_returns_every_unified_record_newest_first(self) -> None:
+        results_file = self.directory / "forecast_results.csv"
+        rows = []
+        for timestamp in (
+            "2026-01-01 17:30:00 IST",
+            "2026-01-03 17:30:00 IST",
+            "2026-01-02 17:30:00 IST",
+        ):
+            rows.append(
+                {
+                    field: timestamp if field == "Analysed Time (IST)" else ""
+                    for field in prediction_logs.FORECAST_RESULTS_FIELDS
+                }
+            )
+        with results_file.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(
+                file, fieldnames=prediction_logs.FORECAST_RESULTS_FIELDS
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+        with patch.object(app, "RESULTS_FILE", results_file):
+            history = app.get_history()
+        self.assertEqual(len(history), 3)
+        self.assertEqual(
+            list(history[0]),
+            prediction_logs.FORECAST_RESULTS_FIELDS,
+        )
+        self.assertEqual(
+            [row["Analysed Time (IST)"] for row in history],
+            [
+                "2026-01-03 17:30:00 IST",
+                "2026-01-02 17:30:00 IST",
+                "2026-01-01 17:30:00 IST",
+            ],
+        )
 
     def test_legacy_records_are_backed_up_and_not_assumed_evaluable(self) -> None:
         logs = self.directory / "logs"

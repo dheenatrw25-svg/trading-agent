@@ -15,6 +15,7 @@ def valid_advisory(direction: str = "UP") -> dict:
         "direction": direction,
         "target_range_low": 110.0,
         "target_range_high": 120.0,
+        "target_price": 115.0,
         "invalidation_price": 90.0,
         "confidence_score": 8,
         "market_regime": "Breakout attempt",
@@ -116,6 +117,12 @@ class DirectionAndRiskTests(unittest.TestCase):
             ):
                 pro_strategist.validate_advisory(valid_advisory(direction))
 
+    def test_exact_target_price_must_be_inside_the_target_range(self) -> None:
+        advisory = valid_advisory()
+        advisory["target_price"] = 121.0
+        with self.assertRaisesRegex(ValueError, "target_price must fall within"):
+            pro_strategist.validate_advisory(advisory)
+
     def test_risk_reward_requires_positive_sided_levels_and_minimum_ratio(self) -> None:
         valid = pro_strategist.calculate_risk_reward(
             100, "UP", 110, 120, 90
@@ -177,6 +184,7 @@ class DirectionAndRiskTests(unittest.TestCase):
         advisory = valid_advisory("DOWN")
         advisory["target_range_low"] = 105.0
         advisory["target_range_high"] = 110.0
+        advisory["target_price"] = 108.0
         advisory["invalidation_price"] = 95.0
         context = {
             "spot": {"current_close": 100.0},

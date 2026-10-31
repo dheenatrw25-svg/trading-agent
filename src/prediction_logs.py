@@ -1,16 +1,32 @@
 import csv
 import datetime
 import hashlib
+import math
 import shutil
+import threading
 import uuid
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .paths import LOGS_DIR
 
 
 BTC_FORECAST_FILE = LOGS_DIR / "btc_forecasts_2h.csv"
 ADVISORY_LOG_FILE = LOGS_DIR / "advisory_log.csv"
+FORECAST_RESULTS_FILE = LOGS_DIR / "forecast_results.csv"
+FORECAST_RESULTS_FIELDS = [
+    "Analysed Time (IST)",
+    "Current Price",
+    "Forecast Hours",
+    "Target Price Range",
+    "Target Price Time (IST)",
+    "Exact Target Price",
+    "UP / DOWN / WAIT",
+    "Reason",
+    "Confidence",
+]
+FORECAST_RESULTS_LOCK = threading.Lock()
 
 # Previous log paths are read-only migration sources. They are never appended to.
 LEGACY_APP_LOG_FILE = LOGS_DIR / "app_predictions_log.csv"
@@ -318,6 +334,298 @@ def append_record(path: Path, fields: list[str], row: dict[str, Any]) -> None:
         file.seek(0, 2)
         writer = csv.DictWriter(file, fieldnames=fields, extrasaction="raise")
         writer.writerow(row)
+
+
+def _format_ist_timestamp(value: object, hours: int = 0) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    try:
+        timestamp = datetime.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if timestamp.tzinfo is None:
+        return ""
+    timestamp = timestamp.astimezone(datetime.timezone.utc) + datetime.timedelta(hours=hours)
+    return timestamp.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S IST")
+
+
+def _format_result_price(value: object) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if price <= 0 or not math.isfinite(price):
+        return ""
+    return f"${price:,.2f}"
+
+
+def _format_result_range(low: object, high: object) -> str:
+    formatted_low = _format_result_price(low)
+    formatted_high = _format_result_price(high)
+    if not formatted_low and not formatted_high:
+        return ""
+    return f"{formatted_low} - {formatted_high}"
+
+
+def _format_result_confidence(value: object) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not 1 <= confidence <= 10:
+        return ""
+    return f"{confidence:g}/10"
+
+
+def _result_direction(direction: object) -> str:
+    normalized = str(direction or "").strip().upper()
+    return {
+        "BULLISH": "UP",
+        "BEARISH": "DOWN",
+        "SIDEWAYS": "WAIT",
+        "NEUTRAL": "WAIT",
+    }.get(normalized, normalized if normalized in {"UP", "DOWN", "WAIT"} else "")
+
+
+def _result_setup_actionable(row: dict[str, Any], direction: str) -> bool:
+    value = str(row.get("setup_actionable", "")).strip().lower()
+    if value:
+        return value in {"true", "1", "yes"}
+    try:
+        current = float(row.get("starting_btc_price", row.get("btc_price_at_prediction")))
+        low = float(row.get("expected_low", row.get("expected_low_2h", row.get("target_low"))))
+        high = float(row.get("expected_high", row.get("expected_high_2h", row.get("target_high"))))
+        invalidation = float(row.get("invalidation_price"))
+    except (TypeError, ValueError):
+        return False
+    risk = current - invalidation if direction == "UP" else invalidation - current
+    midpoint = (low + high) / 2
+    reward = midpoint - current if direction == "UP" else current - midpoint
+    return risk > 0 and reward > 0 and reward / risk >= 1.5
+
+
+def build_forecast_result(
+    row: dict[str, Any],
+    forecast_hours: int | None = None,
+) -> dict[str, str]:
+    horizon_value = forecast_hours or row.get("forecast_horizon_hours")
+    try:
+        horizon = int(horizon_value)
+    except (TypeError, ValueError):
+        horizon = 0
+    if horizon not in (2, 4):
+        horizon = 0
+
+    issue_time = row.get("forecast_issue_timestamp") or row.get("timestamp")
+    low = row.get("expected_low", row.get("expected_low_2h", row.get("target_low")))
+    high = row.get("expected_high", row.get("expected_high_2h", row.get("target_high")))
+    exact_target = row.get(
+        "projected_price",
+        row.get("projected_price_2h", row.get("target_price", "")),
+    )
+    direction = _result_direction(
+        row.get("predicted_direction") or row.get("direction")
+    )
+    confidence = row.get("confidence_score", row.get("confidence", ""))
+    reason = row.get("scenario") or row.get("reasoning") or ""
+
+    if horizon == 4:
+        try:
+            low_number = float(low)
+            high_number = float(high)
+            target_number = float(exact_target)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if not low_number <= target_number <= high_number:
+                raise ValueError("4-hour exact target price must be within its target range.")
+        reason_text = str(reason).lower()
+        setup_actionable = _result_setup_actionable(row, direction)
+        if (
+            not setup_actionable
+            or "not an actionable setup" in reason_text
+            or "non-actionable" in reason_text
+        ):
+            direction = "WAIT"
+        try:
+            if float(confidence) <= 4:
+                direction = "WAIT"
+        except (TypeError, ValueError):
+            pass
+
+    return {
+        "Analysed Time (IST)": _format_ist_timestamp(issue_time),
+        "Current Price": _format_result_price(
+            row.get("starting_btc_price", row.get("btc_price_at_prediction"))
+        ),
+        "Forecast Hours": str(horizon) if horizon else "",
+        "Target Price Range": _format_result_range(low, high),
+        "Target Price Time (IST)": _format_ist_timestamp(issue_time, horizon),
+        "Exact Target Price": _format_result_price(exact_target),
+        "UP / DOWN / WAIT": direction,
+        "Reason": str(reason),
+        "Confidence": _format_result_confidence(confidence),
+    }
+
+
+def _migration_result_sources() -> list[Path]:
+    return [
+        BTC_FORECAST_FILE,
+        ADVISORY_LOG_FILE,
+        LEGACY_MARKET_LOG_FILE,
+        LEGACY_APP_LOG_FILE,
+        LEGACY_SHARED_LOG_FILE,
+    ]
+
+
+def _recover_shared_legacy_market_row(row: dict[str, Any]) -> dict[str, str] | None:
+    values = list(row.values())
+    if len(values) != len(LEGACY_APP_FIELDS) or any(value is not None for value in values[9:]):
+        return None
+    timestamp, ticker, price, direction, confidence, low, high, target, reason = values[:9]
+    if (
+        ticker != "BTC-USD"
+        or str(direction).upper() not in {"BULLISH", "BEARISH", "SIDEWAYS"}
+    ):
+        return None
+    try:
+        numeric_values = [float(value) for value in (price, confidence, low, high, target)]
+    except (TypeError, ValueError):
+        return None
+    if (
+        any(not math.isfinite(value) for value in numeric_values)
+        or numeric_values[0] <= 0
+        or not 1 <= numeric_values[1] <= 10
+        or numeric_values[2] <= 0
+        or numeric_values[3] < numeric_values[2]
+        or not numeric_values[2] <= numeric_values[4] <= numeric_values[3]
+        or not isinstance(reason, str)
+        or not reason.strip()
+    ):
+        return None
+    return {
+        "timestamp": str(timestamp or ""),
+        "forecast_issue_timestamp": str(timestamp or ""),
+        "forecast_horizon_hours": "2",
+        "starting_btc_price": str(price),
+        "predicted_direction": str(direction),
+        "confidence_score": str(confidence),
+        "expected_low_2h": str(low),
+        "expected_high_2h": str(high),
+        "projected_price_2h": str(target),
+        "scenario": reason,
+    }
+
+
+def _source_result_rows(source: Path) -> list[dict[str, str]]:
+    if not source.is_file():
+        return []
+    fields, rows = _read_rows(source)
+    market_fields = set(fields)
+    if {"starting_btc_price", "predicted_direction", "expected_low", "expected_high"}.issubset(market_fields):
+        horizon = 2
+    elif {"starting_btc_price", "predicted_direction", "expected_low_2h", "expected_high_2h"}.issubset(market_fields):
+        horizon = 2
+    elif {"direction", "target_low", "target_high", "btc_price_at_prediction"}.issubset(market_fields):
+        horizon = 4
+    else:
+        print(f"[LOG] Preserving unrecognized forecast log without unified migration: {source}")
+        return []
+
+    migrated: list[dict[str, str]] = []
+    for line_number, row in enumerate(rows, start=2):
+        if None in row or None in row.values():
+            if source == LEGACY_SHARED_LOG_FILE:
+                recovered_row = _recover_shared_legacy_market_row(row)
+                if recovered_row is not None:
+                    migrated.append(build_forecast_result(recovered_row, 2))
+                    continue
+            print(
+                f"[LOG] Skipping malformed unified-migration row {line_number} "
+                f"in {source}; the source file was retained."
+            )
+            continue
+        try:
+            migrated.append(build_forecast_result(row, horizon))
+        except ValueError as exc:
+            print(f"[LOG] Skipping invalid forecast row in {source}: {exc}")
+    return migrated
+
+
+def initialize_forecast_results_log(path: Path | None = None) -> None:
+    path = path or FORECAST_RESULTS_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with FORECAST_RESULTS_LOCK:
+        if path.exists():
+            existing_fields, existing_rows = _read_rows(path)
+            if existing_fields != FORECAST_RESULTS_FIELDS:
+                raise ValueError(
+                    f"Forecast results log {path} has an unexpected CSV header; it was not modified."
+                )
+            seen = {
+                tuple(row.get(field, "") for field in FORECAST_RESULTS_FIELDS)
+                for row in existing_rows
+            }
+            rows: list[dict[str, str]] = []
+        else:
+            seen = set()
+            rows = []
+        for source in _migration_result_sources():
+            for record in _source_result_rows(source):
+                identity = tuple(record[field] for field in FORECAST_RESULTS_FIELDS)
+                if identity not in seen:
+                    rows.append(record)
+                    seen.add(identity)
+
+        if path.exists():
+            if rows:
+                with path.open("a", newline="", encoding="utf-8") as file:
+                    writer = csv.DictWriter(
+                        file,
+                        fieldnames=FORECAST_RESULTS_FIELDS,
+                        extrasaction="raise",
+                    )
+                    writer.writerows(rows)
+        else:
+            temporary_path = path.with_suffix(path.suffix + ".tmp")
+            with temporary_path.open("w", newline="", encoding="utf-8") as file:
+                writer = csv.DictWriter(
+                    file,
+                    fieldnames=FORECAST_RESULTS_FIELDS,
+                    extrasaction="raise",
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+            temporary_path.replace(path)
+
+
+def append_forecast_result(
+    row: dict[str, Any],
+    forecast_hours: int | None = None,
+    path: Path | None = None,
+) -> None:
+    path = path or FORECAST_RESULTS_FILE
+    record = build_forecast_result(row, forecast_hours)
+    initialize_forecast_results_log(path)
+    with FORECAST_RESULTS_LOCK:
+        existing_fields, existing_rows = _read_rows(path)
+        if existing_fields != FORECAST_RESULTS_FIELDS:
+            raise ValueError(
+                f"Forecast results log {path} has an unexpected CSV header; row was not appended."
+            )
+        identity = tuple(record[field] for field in FORECAST_RESULTS_FIELDS)
+        if any(
+            tuple(existing.get(field, "") for field in FORECAST_RESULTS_FIELDS) == identity
+            for existing in existing_rows
+        ):
+            return
+        with path.open("a", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=FORECAST_RESULTS_FIELDS, extrasaction="raise")
+            writer.writerow(record)
 
 
 def utc_now() -> datetime.datetime:

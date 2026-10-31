@@ -18,6 +18,12 @@ internally for risk checks and prediction logging.
 
 - The 2-hour BTC predictor writes only to `logs/btc_forecasts_2h.csv`.
 - Dashboard and scheduled advisory predictions write only to `logs/advisory_log.csv`.
+- Both forecast pipelines also append a display-ready record to
+  `logs/forecast_results.csv`. This unified file uses the same nine columns for
+  2-hour and 4-hour forecasts; times are displayed in IST, and unavailable
+  historical values remain blank.
+- The dashboard history API reads every record from the unified results file,
+  newest first. The detailed evaluator and advisory logs remain unchanged.
 - The prior CSV files are migration inputs. Before migration, they are copied to
   `logs/backups/*.pre-phase1.bak`; the original files are left untouched.
 - Old 2-hour BTC forecasts without verifiable UTC timestamps and source-candle data
@@ -37,12 +43,16 @@ internally for risk checks and prediction logging.
 
 ## Run
 
-Run commands from the repository root:
+Run commands from the repository root in PowerShell. Install dependencies into
+the project virtual environment first; using a different Python interpreter may
+fail with `ModuleNotFoundError` for project dependencies such as `schedule`.
 
 ```powershell
-python -m uvicorn src.app:app --reload
-python -m src.auto_run
-python -m src.market_predictor
-python -m src.trading_agent
-python -m unittest discover -s tests -v
+python -m venv venv
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
+.\venv\Scripts\python.exe -m uvicorn src.app:app --reload
+.\venv\Scripts\python.exe -m src.auto_run
+.\venv\Scripts\python.exe -m src.market_predictor
+.\venv\Scripts\python.exe -m src.trading_agent
+.\venv\Scripts\python.exe -m unittest discover -s tests -v
 ```

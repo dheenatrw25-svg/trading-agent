@@ -139,17 +139,22 @@
           <button id="refreshHistory" type="button" class="self-start rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 transition hover:border-slate-500 hover:text-white sm:self-auto">Refresh history</button>
         </div>
         <div class="overflow-x-auto">
-          <table class="w-full min-w-[620px] text-left">
+          <table class="w-full min-w-[1500px] text-left">
             <thead class="bg-slate-950/30 mono text-[10px] uppercase tracking-wider text-slate-500">
               <tr>
-                <th class="px-5 py-3 font-medium">Timestamp</th>
-                <th class="px-5 py-3 font-medium">Direction</th>
-                <th class="px-5 py-3 font-medium">Price</th>
-                <th class="px-5 py-3 font-medium">Outcome</th>
+                <th class="px-5 py-3 font-medium">Analysed Time (IST)</th>
+                <th class="px-5 py-3 font-medium">Current Price</th>
+                <th class="px-5 py-3 font-medium">Forecast Hours</th>
+                <th class="px-5 py-3 font-medium">Target Price Range</th>
+                <th class="px-5 py-3 font-medium">Target Price Time (IST)</th>
+                <th class="px-5 py-3 font-medium">Exact Target Price</th>
+                <th class="px-5 py-3 font-medium">UP / DOWN / WAIT</th>
+                <th class="px-5 py-3 font-medium">Reason</th>
+                <th class="px-5 py-3 font-medium">Confidence</th>
               </tr>
             </thead>
             <tbody id="historyBody" class="divide-y divide-slate-800/80 text-sm">
-              <tr><td colspan="4" class="px-5 py-8 text-center text-slate-500">Loading forecast history…</td></tr>
+              <tr><td colspan="9" class="px-5 py-8 text-center text-slate-500">Loading forecast history…</td></tr>
             </tbody>
           </table>
         </div>
@@ -237,7 +242,7 @@
       if (!Array.isArray(rows) || rows.length === 0) {
         const tr = document.createElement("tr");
         const td = document.createElement("td");
-        td.colSpan = 4;
+        td.colSpan = 9;
         td.className = "px-5 py-8 text-center text-slate-500";
         td.textContent = "No forecasts logged yet.";
         tr.append(td);
@@ -248,18 +253,23 @@
       for (const row of rows) {
         const tr = document.createElement("tr");
         tr.className = "transition hover:bg-white/[.02]";
-        const direction = String(row.direction || "UNKNOWN").toUpperCase();
+        const direction = String(row["UP / DOWN / WAIT"] || "").toUpperCase();
         const directionClass = direction === "UP" ? "text-emerald-300" : direction === "DOWN" ? "text-rose-300" : "text-amber-300";
         const values = [
-          [row.timestamp || "—", "mono whitespace-nowrap text-xs text-slate-400"],
+          [row["Analysed Time (IST)"], "mono whitespace-nowrap text-xs text-slate-400"],
+          [row["Current Price"], "mono whitespace-nowrap text-xs text-slate-200"],
+          [row["Forecast Hours"], "mono text-xs text-slate-300"],
+          [row["Target Price Range"], "mono whitespace-nowrap text-xs text-slate-200"],
+          [row["Target Price Time (IST)"], "mono whitespace-nowrap text-xs text-slate-400"],
+          [row["Exact Target Price"], "mono whitespace-nowrap text-xs text-slate-200"],
           [direction, `mono text-xs font-bold ${directionClass}`],
-          [formatPrice(row.price), "mono text-xs text-slate-200"],
-          [row.outcome || "Pending", "text-xs text-slate-300"]
+          [row["Reason"], "min-w-[320px] whitespace-normal text-xs text-slate-300"],
+          [row["Confidence"], "mono whitespace-nowrap text-xs text-slate-300"]
         ];
         for (const [value, className] of values) {
           const td = document.createElement("td");
           td.className = `px-5 py-4 ${className}`;
-          td.textContent = value;
+          td.textContent = value || "—";
           tr.append(td);
         }
         body.append(tr);
@@ -268,7 +278,7 @@
 
     async function loadHistory() {
       const body = byId("historyBody");
-      body.innerHTML = '<tr><td colspan="4" class="px-5 py-8 text-center text-slate-500"><span class="skeleton inline-block h-4 w-40 rounded"></span></td></tr>';
+      body.innerHTML = '<tr><td colspan="9" class="px-5 py-8 text-center text-slate-500"><span class="skeleton inline-block h-4 w-40 rounded"></span></td></tr>';
       try {
         const response = await fetch("/api/history", { headers: { "Accept": "application/json" } });
         const data = await response.json();
@@ -278,7 +288,7 @@
         body.replaceChildren();
         const tr = document.createElement("tr");
         const td = document.createElement("td");
-        td.colSpan = 4;
+        td.colSpan = 9;
         td.className = "px-5 py-8 text-center text-rose-300";
         td.textContent = `History unavailable: ${error.message}`;
         tr.append(td);

@@ -18,6 +18,7 @@ from .prediction_logs import (
     BTC_FORECAST_FIELDS,
     BTC_FORECAST_FILE,
     append_record,
+    append_forecast_result,
     initialize_btc_forecast_log,
     to_utc_iso,
     utc_now,
@@ -410,6 +411,7 @@ def log_prediction(
 
     initialize_btc_forecast_log(log_file)
     append_record(log_file, BTC_FORECAST_FIELDS, record)
+    append_forecast_result(record, FORECAST_HORIZON_HOURS)
 
 def run_predictor(ticker: str = "BTC-USD"):
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 1. Generating charts for {ticker}...")

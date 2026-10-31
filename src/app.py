@@ -1,4 +1,5 @@
 import datetime
+import csv
 from threading import Lock
 from typing import Any
 
@@ -12,7 +13,11 @@ from .prediction_logs import (
     ADVISORY_LOG_FIELDS,
     ADVISORY_LOG_FILE,
     append_record,
+    append_forecast_result,
+    FORECAST_RESULTS_FILE,
+    FORECAST_RESULTS_FIELDS,
     initialize_advisory_log,
+    initialize_forecast_results_log,
     to_utc_iso,
     utc_now,
 )
@@ -21,6 +26,7 @@ from .prediction_logs import (
 INDEX_FILE = PROJECT_ROOT / "templates" / "index.html"
 CHART_FILE = ASSETS_DIR / "prediction_chart.png"
 HISTORY_FILE = ADVISORY_LOG_FILE
+RESULTS_FILE = FORECAST_RESULTS_FILE
 FORECAST_HORIZON_HOURS = 4
 ANALYSIS_LOCK = Lock()
 
@@ -65,6 +71,22 @@ def log_prediction(
     }
     initialize_advisory_log(HISTORY_FILE)
     append_record(HISTORY_FILE, ADVISORY_LOG_FIELDS, row)
+    result_row = {
+        **row,
+        "target_price": decision_json["target_price"],
+        "setup_actionable": pro_strategist.calculate_risk_reward(
+            market_context["spot"]["current_close"],
+            decision_json["direction"],
+            decision_json["target_range_low"],
+            decision_json["target_range_high"],
+            decision_json["invalidation_price"],
+        )["actionable"],
+    }
+    append_forecast_result(
+        result_row,
+        FORECAST_HORIZON_HOURS,
+        path=RESULTS_FILE,
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -128,69 +150,32 @@ def get_chart() -> FileResponse | JSONResponse:
     )
 
 
-def _history_record(row: dict[str, Any]) -> dict[str, Any]:
-    direction = row.get("direction") or row.get("predicted_direction") or "UNKNOWN"
-    direction = {
-        "BULLISH": "UP",
-        "BEARISH": "DOWN",
-        "SIDEWAYS": "NEUTRAL",
-    }.get(str(direction).upper(), str(direction).upper())
-
-    outcome = row.get("actual_outcome")
-    if not outcome or pd.isna(outcome):
-        outcome = "Pending" if str(row.get("graded", "")).lower() == "false" else "—"
-
-    price = row.get("btc_price_at_prediction")
-    if price is None or pd.isna(price):
-        price = row.get("current_price")
-
-    confidence = row.get("confidence")
-    if confidence is None or pd.isna(confidence):
-        confidence = row.get("confidence_score")
-
-    target_low = row.get("target_low")
-    if target_low is None or pd.isna(target_low):
-        target_low = row.get("expected_low_2h")
-
-    target_high = row.get("target_high")
-    if target_high is None or pd.isna(target_high):
-        target_high = row.get("expected_high_2h")
-
-    return {
-        "timestamp": row.get("timestamp", ""),
-        "direction": direction,
-        "price": None if price is None or pd.isna(price) else float(price),
-        "outcome": str(outcome),
-        "confidence": (
-            None if confidence is None or pd.isna(confidence) else confidence
-        ),
-        "target_low": (
-            None if target_low is None or pd.isna(target_low) else float(target_low)
-        ),
-        "target_high": (
-            None if target_high is None or pd.isna(target_high) else float(target_high)
-        ),
-        "market_regime": row.get("market_regime", ""),
-        "reasoning": row.get("reasoning") or row.get("scenario") or "",
-    }
-
-
 @app.get("/api/history", response_model=None)
 def get_history() -> list[dict[str, Any]] | JSONResponse:
     try:
-        if not HISTORY_FILE.is_file():
-            initialize_advisory_log(HISTORY_FILE)
-        history = pd.read_csv(HISTORY_FILE)
-        if "timestamp" not in history.columns:
+        if not RESULTS_FILE.is_file():
+            initialize_forecast_results_log(RESULTS_FILE)
+        with RESULTS_FILE.open("r", newline="", encoding="utf-8-sig") as file:
+            reader = csv.DictReader(file)
+            if reader.fieldnames != FORECAST_RESULTS_FIELDS:
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": "Forecast results log has an unexpected schema."},
+                )
+            history = list(reader)
+        if any(None in row for row in history):
             return JSONResponse(
                 status_code=500,
-                content={"error": "Prediction log is missing the timestamp column."},
+                content={"error": "Forecast results log contains malformed rows."},
             )
-        history = history.tail(5)
+        history.sort(
+            key=lambda row: row["Analysed Time (IST)"],
+            reverse=True,
+        )
         return [
-            _history_record(row)
-            for row in history.to_dict(orient="records")
-        ][::-1]
+            {field: row.get(field, "") or "" for field in FORECAST_RESULTS_FIELDS}
+            for row in history
+        ]
     except Exception as exc:
         print(f"[API] History read failed: {exc}")
         return JSONResponse(
