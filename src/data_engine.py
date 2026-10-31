@@ -78,6 +78,47 @@ def fetch_spot_data() -> pd.DataFrame:
     return df
 
 
+def _fetch_15m_indicators() -> dict[str, float]:
+    print("[DATA] Fetching BTC-USD 15-minute candles for RSI...")
+    df = yf.download(
+        "BTC-USD",
+        period="5d",
+        interval="15m",
+        progress=False,
+    )
+    df = _flatten_columns(df)
+    confirmed = _confirmed_candles(df, "15m")
+    close = confirmed["Close"].astype(float)
+    delta = close.diff()
+    average_gain = delta.clip(lower=0).ewm(
+        alpha=1 / 14,
+        min_periods=14,
+        adjust=False,
+    ).mean()
+    average_loss = (-delta.clip(upper=0)).ewm(
+        alpha=1 / 14,
+        min_periods=14,
+        adjust=False,
+    ).mean()
+    latest_gain = float(average_gain.iloc[-1])
+    latest_loss = float(average_loss.iloc[-1])
+    if not math.isfinite(latest_gain) or not math.isfinite(latest_loss):
+        raise RuntimeError("Insufficient completed 15-minute candles to calculate RSI.")
+    if latest_gain == 0 and latest_loss == 0:
+        rsi = 50.0
+    elif latest_loss == 0:
+        rsi = 100.0
+    else:
+        relative_strength = latest_gain / latest_loss
+        rsi = 100 - (100 / (1 + relative_strength))
+    latest_close = float(close.iloc[-1])
+    print(f"[DATA] BTC-USD 15-minute close={latest_close:.2f}, RSI={rsi:.2f}.")
+    return {
+        "current_price": latest_close,
+        "rsi_15m": round(rsi, 2),
+    }
+
+
 def fetch_macro_context() -> dict[str, float]:
     print("[DATA] Fetching US Dollar Index (DX-Y.NYB)...")
     df = yf.download(
@@ -209,6 +250,201 @@ def _fetch_open_interest_trend(symbol: str) -> dict[str, Any]:
     return result
 
 
+def fetch_order_book_walls(symbol: str = "BTCUSDT") -> dict[str, Any]:
+    try:
+        response = requests.get(
+            f"{BINANCE_FUTURES_BASE_URL}/fapi/v1/depth",
+            params={"symbol": symbol, "limit": 1000},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        order_book = response.json()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Binance order book request failed for {symbol}: {exc}"
+        ) from exc
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Binance returned invalid JSON for the {symbol} order book."
+        ) from exc
+
+    if not isinstance(order_book, dict):
+        raise RuntimeError(f"Binance returned an invalid {symbol} order book.")
+
+    def largest_wall(side_name: str, side_label: str) -> dict[str, float]:
+        levels = order_book.get(side_name)
+        if not isinstance(levels, list) or not levels:
+            raise RuntimeError(
+                f"Binance returned no {side_label} levels for {symbol}."
+            )
+
+        largest: tuple[float, float] | None = None
+        for level in levels:
+            if not isinstance(level, (list, tuple)) or len(level) < 2:
+                raise RuntimeError(
+                    f"Binance returned a malformed {side_label} level for {symbol}."
+                )
+            try:
+                price, quantity = float(level[0]), float(level[1])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Binance returned a non-numeric {side_label} level for {symbol}."
+                ) from exc
+            if (
+                not math.isfinite(price)
+                or not math.isfinite(quantity)
+                or price <= 0
+                or quantity < 0
+            ):
+                raise RuntimeError(
+                    f"Binance returned an invalid {side_label} level for {symbol}."
+                )
+            if largest is None or quantity > largest[1]:
+                largest = (price, quantity)
+
+        if largest is None or largest[1] <= 0:
+            raise RuntimeError(
+                f"Binance returned no positive-quantity {side_label} level for {symbol}."
+            )
+        price, quantity = largest
+        return {
+            "price_usd": price,
+            "quantity_btc": quantity,
+            "notional_usd": price * quantity,
+        }
+
+    return {
+        "symbol": symbol,
+        "depth_limit": 1000,
+        "snapshot_timestamp_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+        "largest_buy_wall": largest_wall("bids", "bid"),
+        "largest_sell_wall": largest_wall("asks", "ask"),
+        "interpretation_note": (
+            "A single snapshot shows displayed resting liquidity only; it cannot "
+            "establish persistence or identify spoofing."
+        ),
+    }
+
+
+def _fetch_taker_pressure(symbol: str) -> dict[str, Any]:
+    unavailable = {
+        "taker_pressure_status": "Unavailable",
+        "taker_buy_volume_btc": None,
+        "taker_sell_volume_btc": None,
+        "net_taker_volume_btc": None,
+        "taker_buy_sell_ratio": None,
+        "taker_pressure_window_hours": None,
+        "taker_pressure_timestamp_utc": None,
+        "taker_pressure_reason": "",
+    }
+    try:
+        response = requests.get(
+            f"{BINANCE_FUTURES_BASE_URL}/futures/data/takerlongshortRatio",
+            params={"symbol": symbol, "period": "15m", "limit": 12},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        history = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        unavailable["taker_pressure_reason"] = (
+            f"Binance taker-volume data unavailable: {exc}"
+        )
+        print(f"[DATA] {unavailable['taker_pressure_reason']}")
+        return unavailable
+
+    if not isinstance(history, list) or len(history) < 8:
+        unavailable["taker_pressure_reason"] = (
+            "Binance returned fewer than eight 15-minute taker-volume observations."
+        )
+        print(f"[DATA] {unavailable['taker_pressure_reason']}")
+        return unavailable
+
+    try:
+        observations = sorted(
+            (
+                int(record["timestamp"]),
+                float(record["buyVol"]),
+                float(record["sellVol"]),
+            )
+            for record in history
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        unavailable["taker_pressure_reason"] = (
+            f"Binance taker-volume data had an invalid shape: {exc}"
+        )
+        print(f"[DATA] {unavailable['taker_pressure_reason']}")
+        return unavailable
+
+    if any(
+        not math.isfinite(buy_volume)
+        or not math.isfinite(sell_volume)
+        or buy_volume < 0
+        or sell_volume < 0
+        for _, buy_volume, sell_volume in observations
+    ):
+        unavailable["taker_pressure_reason"] = (
+            "Binance taker-volume observations contained invalid quantities."
+        )
+        print(f"[DATA] {unavailable['taker_pressure_reason']}")
+        return unavailable
+
+    observations = observations[-12:]
+    latest_timestamp = observations[-1][0]
+    now_milliseconds = pd.Timestamp.now(tz="UTC").timestamp() * 1000
+    if (
+        len({timestamp for timestamp, _, _ in observations}) != len(observations)
+        or latest_timestamp > now_milliseconds + 60_000
+        or now_milliseconds - latest_timestamp > 30 * 60_000
+    ):
+        unavailable["taker_pressure_reason"] = (
+            "Binance taker-volume observations were duplicated or the latest "
+            "observation was stale or future-dated."
+        )
+        print(f"[DATA] {unavailable['taker_pressure_reason']}")
+        return unavailable
+
+    buy_volume = sum(buy for _, buy, _ in observations)
+    sell_volume = sum(sell for _, _, sell in observations)
+    total_volume = buy_volume + sell_volume
+    if total_volume <= 0:
+        unavailable["taker_pressure_reason"] = (
+            "Binance taker-volume observations contained no traded volume."
+        )
+        print(f"[DATA] {unavailable['taker_pressure_reason']}")
+        return unavailable
+
+    net_volume = buy_volume - sell_volume
+    buy_sell_ratio = buy_volume / sell_volume if sell_volume > 0 else None
+    imbalance = net_volume / total_volume
+    if imbalance >= 0.05:
+        status = "Aggressive Bid Lifting (Bullish CVD)"
+    elif imbalance <= -0.05:
+        status = "Aggressive Ask Hitting (Bearish CVD)"
+    else:
+        status = "Neutral/Choppy"
+
+    window_hours = len(observations) * 15 / 60
+    timestamp = pd.to_datetime(latest_timestamp, unit="ms", utc=True).isoformat()
+    print(
+        f"[DATA] Taker pressure over {window_hours:.2f} hours: {status} "
+        f"(net {net_volume:.4f} BTC)."
+    )
+    return {
+        "taker_pressure_status": status,
+        "taker_buy_volume_btc": buy_volume,
+        "taker_sell_volume_btc": sell_volume,
+        "net_taker_volume_btc": net_volume,
+        "taker_buy_sell_ratio": buy_sell_ratio,
+        "taker_pressure_window_hours": window_hours,
+        "taker_pressure_timestamp_utc": timestamp,
+        "taker_pressure_reason": (
+            "Aggregated Binance 15-minute taker buy/sell volumes; statuses require "
+            "at least a 5% net-volume imbalance. This is a short-term flow proxy, "
+            "not a guarantee of continued price direction."
+        ),
+    }
+
+
 def fetch_derivatives_data(symbol: str = "BTCUSDT") -> dict[str, Any]:
     print(f"[DATA] Fetching Binance futures data for {symbol}...")
     endpoints = {
@@ -263,6 +499,7 @@ def fetch_derivatives_data(symbol: str = "BTCUSDT") -> dict[str, Any]:
         "funding_rate": funding_rate,
         "annualized_funding_rate_pct": annualized_funding_rate_pct,
         **_fetch_open_interest_trend(symbol),
+        **_fetch_taker_pressure(symbol),
     }
 
 
@@ -365,11 +602,13 @@ def compile_market_context(spot_data: pd.DataFrame | None = None) -> dict[str, A
     if spot_data.empty:
         raise RuntimeError("Cannot compile market context from empty BTC-USD candles.")
     price_action = _build_price_action_context(spot_data)
-    confirmed_spot_data = _confirmed_candles(spot_data, "4h")
+    _confirmed_candles(spot_data, "4h")
     macro_context = fetch_macro_context()
     derivatives_data = fetch_derivatives_data()
+    order_book_data = fetch_order_book_walls()
+    technical_indicators = _fetch_15m_indicators()
 
-    current_spot_close = float(confirmed_spot_data["Close"].iloc[-1])
+    current_spot_close = technical_indicators["current_price"]
     context = {
         "spot": {
             "symbol": "BTC-USD",
@@ -378,9 +617,75 @@ def compile_market_context(spot_data: pd.DataFrame | None = None) -> dict[str, A
         "price_action": price_action,
         "macro": macro_context,
         "derivatives": derivatives_data,
+        "order_book": order_book_data,
+        "technical_indicators": {
+            "rsi_15m": technical_indicators["rsi_15m"],
+            "dxy_macro_trend": f"{macro_context['dxy_daily_change_pct']:+.1f}%",
+        },
+        "institutional_order_flow": _build_institutional_order_flow(
+            order_book_data,
+            derivatives_data,
+        ),
     }
+    context["current_price"] = technical_indicators["current_price"]
     print("[DATA] Market context compiled.")
     return context
+
+
+def _build_institutional_order_flow(
+    order_book: dict[str, Any],
+    derivatives: dict[str, Any],
+) -> dict[str, Any]:
+    buy_wall = order_book.get("largest_buy_wall", {})
+    sell_wall = order_book.get("largest_sell_wall", {})
+    buy_price = buy_wall.get("price_usd")
+    sell_price = sell_wall.get("price_usd")
+    buy_notional = buy_wall.get("notional_usd")
+    sell_notional = sell_wall.get("notional_usd")
+
+    taker_status = derivatives.get("taker_pressure_status", "Unavailable")
+    cvd_statuses = {
+        "Aggressive Bid Lifting (Bullish CVD)": "Aggressive Market Buying (Bullish CVD)",
+        "Aggressive Ask Hitting (Bearish CVD)": "Aggressive Market Selling (Bearish CVD)",
+        "Neutral/Choppy": "Neutral/Choppy",
+        "Unavailable": "Unavailable",
+    }
+    open_interest_statuses = {
+        "rising": "Rising OI (Trend Supported)",
+        "falling": "Falling OI (Position Closing/Reversal Risk)",
+        "stagnant": "Stagnant OI (Limited Trend Confirmation)",
+        "unavailable": "Unavailable",
+    }
+    return {
+        "largest_buy_wall_price": buy_price,
+        "largest_buy_wall_usd": (
+            f"${buy_notional:,.0f}"
+            if isinstance(buy_notional, (int, float))
+            and math.isfinite(buy_notional)
+            else "Unavailable"
+        ),
+        "largest_sell_wall_price": sell_price,
+        "largest_sell_wall_usd": (
+            f"${sell_notional:,.0f}"
+            if isinstance(sell_notional, (int, float))
+            and math.isfinite(sell_notional)
+            else "Unavailable"
+        ),
+        "cvd_status": cvd_statuses.get(taker_status, "Unavailable"),
+        "open_interest_trend": open_interest_statuses.get(
+            derivatives.get("open_interest_trend"),
+            "Unavailable",
+        ),
+    }
+
+
+def build_ai_prompt_payload(market_context: dict[str, Any]) -> dict[str, Any]:
+    """Project the rich internal context into the stable AI-facing schema."""
+    return {
+        "current_price": market_context["current_price"],
+        "technical_indicators": market_context["technical_indicators"],
+        "institutional_order_flow": market_context["institutional_order_flow"],
+    }
 
 
 if __name__ == "__main__":

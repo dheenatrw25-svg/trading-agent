@@ -47,6 +47,18 @@ an order to buy or sell.
   rejection high.
 - A wick alone does not confirm a breakout, reclaim, or rejection. Require
   completed-candle close evidence and describe missing confirmation.
+- Treat nearby order-book walls as possible liquidity obstacles, not guaranteed
+  support or resistance. Do not place an UP target beyond a nearby sell wall, or
+  a DOWN target beyond a nearby buy wall, unless supplied price-action evidence
+  shows the wall was absorbed or cleared. If targeting before a wall, use an
+  actual supplied level; never invent a fixed price offset.
+- Compare taker pressure with completed-candle price action. If price rises
+  while taker pressure is aggressively selling, or falls while it is
+  aggressively buying, describe the evidence as conflicting. This divergence
+  alone does not confirm a trap or justify reversing direction. Seek
+  confirmation from candle closes, volume, and validated open-interest context.
+  If evidence remains contradictory with no clear edge, use confidence 4/10 or
+  lower and state that the forecast is not actionable.
 
 ## B. Derivatives and positioning
 

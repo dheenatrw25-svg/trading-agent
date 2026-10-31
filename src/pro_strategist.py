@@ -18,13 +18,18 @@ load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 PRO_TRADER_PROMPT = """You are an elite institutional quantitative cryptocurrency analyst. Your objective is to provide highly accurate, probabilistic market forecasts with strict risk management.
 You have two inputs:
 1. A visual chart displaying price action and OHLCV-based Volume Profile levels (Yellow = Point of Control, Cyan = Value Area High/Low).
-2. A JSON payload containing exact spot prices, up to 20 timestamped completed four-hour candles, volume comparisons, actual recent swing levels, derivatives positioning (Open Interest, Funding Rates), and macro conditions (DXY).
-3. The four-hour trading playbook. Apply its rules, thresholds, evidence requirements, and risk/reward test.
+2. A JSON payload using the current_price, technical_indicators, and institutional_order_flow schema.
+3. Supporting market details containing completed-candle context, volume profile, macro data, and derivative measurements.
+4. The four-hour trading playbook. Apply its rules, thresholds, evidence requirements, and risk/reward test.
 YOUR CONFLUENCE RUBRIC:
 - Treat the advisory as a directional forecast, not an instruction to buy or sell and not an automatic trading system.
 - The direction MUST be exactly UP or DOWN. When evidence is unclear or contradictory, choose the best-supported direction, normally use confidence 4/10 or lower when no meaningful edge exists, and explicitly state that this is not an actionable setup.
 - Use only completed four-hour candles; a wick alone does not confirm breakout, reclaim, or rejection.
 - Apply the supplied macro, volume, funding, open-interest, setup, and reward/risk rules. Do not infer open-interest change from a single snapshot or fabricate unavailable data.
+- Treat order-book walls as displayed liquidity in one timestamped snapshot, not proof of persistent support/resistance or spoofing.
+- Treat taker-volume pressure as a short-term flow proxy, not a guarantee of continued price direction.
+- Liquidity awareness: consider a nearby sell wall as potential overhead resistance for an UP forecast and a nearby buy wall as potential support for a DOWN forecast. Do not set a target beyond a nearby opposing wall unless supplied price-action evidence shows it was absorbed or cleared. If a target is placed before a wall, use a level grounded in supplied market data; never invent a fixed offset from the wall. A wall is not a guaranteed barrier, and it must not override completed-candle confirmation or the playbook's risk/reward rules.
+- Trap avoidance: compare taker-pressure status with completed-candle price action. If price rises while taker pressure is aggressively selling, or price falls while taker pressure is aggressively buying, explicitly describe the disagreement as conflicting evidence; do not claim that anyone is lying or that a trap is confirmed. Do not reverse direction based on this divergence alone. Seek confirmation from candle closes, volume, and validated open-interest context; if evidence remains contradictory with no clear edge, use confidence 4/10 or lower and state that the forecast is not actionable.
 - Every target, invalidation, swing, and liquidity level must come from the supplied volume profile or actual candle data. Do not invent price levels.
 OUTPUT RESTRICTION: Output YOUR ENTIRE RESPONSE as a single, valid JSON object. No markdown formatting.
 The forecast horizon is the next 4 hours.
@@ -282,7 +287,22 @@ def generate_trading_advisory(
     if not image_path.is_file():
         raise FileNotFoundError(f"Chart image not found: {image_path}")
 
-    data_string = json.dumps(market_context, indent=2)
+    data_string = json.dumps(
+        data_engine.build_ai_prompt_payload(market_context),
+        indent=2,
+    )
+    supporting_context = {
+        key: market_context[key]
+        for key in (
+            "price_action",
+            "macro",
+            "derivatives",
+            "order_book",
+            "volume_profile",
+        )
+        if key in market_context
+    }
+    supporting_data_string = json.dumps(supporting_context, indent=2)
     playbook = load_playbook()
     regime_context = market_context.get("market_regime")
     if not isinstance(regime_context, str) or not regime_context.strip():
@@ -307,6 +327,7 @@ def generate_trading_advisory(
                         PRO_TRADER_PROMPT,
                         f"Four-hour trading playbook:\n{playbook}",
                         data_string,
+                        f"Supporting market details:\n{supporting_data_string}",
                         f"Relevant lessons from past trades:\n{past_lessons}",
                         chart_image,
                     ],

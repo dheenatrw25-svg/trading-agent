@@ -10,6 +10,12 @@
 
 ## Forecast records and evaluation
 
+The Gemini advisory receives a normalized JSON payload with `current_price`,
+`technical_indicators` (`rsi_15m` and formatted `dxy_macro_trend`), and
+`institutional_order_flow` (formatted order-book walls, taker-pressure status,
+and open-interest trend). The application retains the detailed market context
+internally for risk checks and prediction logging.
+
 - The 2-hour BTC predictor writes only to `logs/btc_forecasts_2h.csv`.
 - Dashboard and scheduled advisory predictions write only to `logs/advisory_log.csv`.
 - The prior CSV files are migration inputs. Before migration, they are copied to
