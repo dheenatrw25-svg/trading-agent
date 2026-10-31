@@ -102,3 +102,20 @@ Use `dxy_daily_change_pct` as context, not as an automatic direction rule:
 - When evidence is unclear or contradictory and no meaningful edge exists,
   choose the best-supported direction, normally use confidence 4/10 or lower,
   and explain the uncertainty and non-actionable status.
+
+## E. Two-hour forecast range constraints
+
+The BTC 2-hour predictor uses these deterministic range rules after validating
+the model response:
+
+- The Expected 2H Range width (`high - low`) must not exceed $450.
+- For a BEARISH forecast, anchor the range high at or above current price, with
+  no more than a $50 buffer above it; extend the range downward toward the
+  projected 2-hour price.
+- For a BULLISH forecast, anchor the range low at or below current price, with
+  no more than a $50 buffer below it; extend the range upward toward the
+  projected 2-hour price.
+- For a SIDEWAYS forecast or a WAIT action, center the range evenly around
+  current price.
+- These constraints apply to the 2-hour predictor and do not change this
+  playbook's four-hour advisory horizon.

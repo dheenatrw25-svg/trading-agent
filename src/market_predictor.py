@@ -27,6 +27,8 @@ load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 
 LOG_FILE = BTC_FORECAST_FILE
 FORECAST_HORIZON_HOURS = 2
+MAX_EXPECTED_RANGE_WIDTH = 450.0
+MAX_DIRECTIONAL_ANCHOR_BUFFER = 50.0
 ALLOWED_DIRECTIONS = {"BULLISH", "BEARISH", "SIDEWAYS"}
 REQUIRED_PREDICTION_FIELDS = {
     "predicted_direction",
@@ -38,7 +40,54 @@ REQUIRED_PREDICTION_FIELDS = {
 }
 
 
-def validate_prediction(prediction: object) -> dict:
+def clamp_prediction_range(
+    direction: str,
+    current_price: float,
+    range_low: float,
+    range_high: float,
+    max_width: float = MAX_EXPECTED_RANGE_WIDTH,
+) -> tuple[float, float]:
+    """Limit the 2H range width and anchor it to the forecast direction."""
+    values = (current_price, range_low, range_high, max_width)
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        for value in values
+    ):
+        raise ValueError("Forecast range values must be finite numbers.")
+    if current_price <= 0 or range_low <= 0 or range_high <= 0 or max_width <= 0:
+        raise ValueError("Forecast range values and maximum width must be positive.")
+    if range_low > range_high:
+        raise ValueError("Forecast range low price exceeds its high price.")
+
+    direction = (direction or "").strip().upper()
+    if direction == "BEARISH":
+        range_high = max(
+            current_price,
+            min(range_high, current_price + MAX_DIRECTIONAL_ANCHOR_BUFFER),
+        )
+        range_low = min(range_low, current_price)
+        range_low = max(range_low, range_high - max_width, 0.01)
+    elif direction == "BULLISH":
+        range_low = max(
+            min(range_low, current_price),
+            current_price - MAX_DIRECTIONAL_ANCHOR_BUFFER,
+        )
+        range_high = max(range_high, current_price)
+        range_high = min(range_high, range_low + max_width)
+    else:
+        width = min(range_high - range_low, max_width)
+        range_low = current_price - width / 2
+        range_high = current_price + width / 2
+        if range_low <= 0:
+            range_low = 0.01
+            range_high = min(current_price * 2 - 0.01, range_low + max_width)
+
+    return round(range_low, 2), round(range_high, 2)
+
+
+def validate_prediction(prediction: object, metrics: dict | None = None) -> dict:
     if not isinstance(prediction, dict):
         raise ValueError("Gemini forecast must be a JSON object.")
     missing = REQUIRED_PREDICTION_FIELDS.difference(prediction)
@@ -83,6 +132,30 @@ def validate_prediction(prediction: object) -> dict:
         raise ValueError("Gemini predicted_scenario must be a non-empty string.")
     validated = dict(prediction)
     validated["predicted_direction"] = direction.strip().upper()
+    if metrics is not None:
+        current_price = metrics.get("current_price")
+        if (
+            isinstance(current_price, bool)
+            or not isinstance(current_price, (int, float))
+            or not math.isfinite(current_price)
+            or current_price <= 0
+        ):
+            raise ValueError("Current BTC price must be finite and positive.")
+
+        clamp_direction = (
+            "SIDEWAYS"
+            if str(validated.get("action", "")).strip().upper() == "WAIT"
+            else validated["predicted_direction"]
+        )
+        (
+            validated["expected_low_next_2h"],
+            validated["expected_high_next_2h"],
+        ) = clamp_prediction_range(
+            clamp_direction,
+            float(current_price),
+            prices["expected_low_next_2h"],
+            prices["expected_high_next_2h"],
+        )
     return validated
 
 # ==========================================
@@ -226,6 +299,18 @@ def predict_next_2_hours(image_path: str, metrics: dict, ticker: str) -> dict:
     2. Key support and resistance zones (recent swing highs and lows).
     3. Momentum and volatility using the provided RSI and ATR numbers.
 
+    Expected 2H range constraints:
+    - The total range width (high minus low) MUST NOT exceed $450.
+    - For BEARISH forecasts, anchor the range high at or above current_price,
+      but no more than $50 above it. Extend the rest of the range downward
+      toward projected_price_in_2h; the range must not straddle current_price.
+    - For BULLISH forecasts, anchor the range low at or below current_price,
+      but no more than $50 below it. Extend the rest of the range upward
+      toward projected_price_in_2h; the range must not straddle current_price.
+    - For SIDEWAYS forecasts or action WAIT, center the range evenly around
+      current_price.
+    These are hard constraints; do not return a wider or oppositely anchored range.
+
     Respond ONLY in valid JSON matching this exact structure:
     {
         "predicted_direction": "BULLISH" | "BEARISH" | "SIDEWAYS",
@@ -254,7 +339,7 @@ def predict_next_2_hours(image_path: str, metrics: dict, ticker: str) -> dict:
     )
 
     try:
-        return validate_prediction(json.loads(response.text))
+        return validate_prediction(json.loads(response.text), metrics)
     except (json.JSONDecodeError, TypeError) as exc:
         raise ValueError("Gemini response was not a valid JSON forecast.") from exc
 
@@ -268,7 +353,7 @@ def log_prediction(
     log_file: Path = LOG_FILE,
     issued_at: datetime.datetime | None = None,
 ) -> None:
-    prediction = validate_prediction(prediction)
+    prediction = validate_prediction(prediction, metrics)
     issue_time = issued_at or utc_now()
     if issue_time.tzinfo is None:
         raise ValueError("Forecast issue timestamp must include a timezone.")
@@ -335,7 +420,7 @@ def run_predictor(ticker: str = "BTC-USD"):
 
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 3. Asking Gemini for 2-hour prediction...")
     prediction = predict_next_2_hours(chart_path, metrics, ticker)
-    prediction = validate_prediction(prediction)
+    prediction = validate_prediction(prediction, metrics)
 
     print("\n================ 2-HOUR MARKET FORECAST ================")
     print(f"Asset:               {ticker}")

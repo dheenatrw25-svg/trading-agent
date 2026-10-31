@@ -118,6 +118,112 @@ class ForecastLoggingAndEvaluationTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, message):
                 market_predictor.validate_prediction(value)
 
+    def test_bearish_range_is_width_limited_and_anchored_at_current_price(self) -> None:
+        prediction = valid_market_forecast()
+        prediction.update(
+            {
+                "predicted_direction": "BEARISH",
+                "expected_high_next_2h": 80000.0,
+                "expected_low_next_2h": 79000.0,
+                "projected_price_in_2h": 79100.0,
+            }
+        )
+
+        result = market_predictor.validate_prediction(
+            prediction, {"current_price": 79800.0}
+        )
+
+        self.assertEqual(result["expected_high_next_2h"], 79850.0)
+        self.assertLessEqual(result["expected_low_next_2h"], 79800.0)
+        self.assertLessEqual(
+            result["expected_high_next_2h"] - result["expected_low_next_2h"],
+            market_predictor.MAX_EXPECTED_RANGE_WIDTH,
+        )
+
+    def test_clamp_prediction_range_handles_directional_and_centered_ranges(self) -> None:
+        bearish_low, bearish_high = market_predictor.clamp_prediction_range(
+            "BEARISH", 79800.0, 79000.0, 80000.0
+        )
+        self.assertLessEqual(bearish_high, 79800.0 + 50.0)
+        self.assertLessEqual(bearish_high - bearish_low, 450.0)
+
+        bullish_low, bullish_high = market_predictor.clamp_prediction_range(
+            "BULLISH", 79800.0, 79000.0, 81000.0
+        )
+        self.assertGreaterEqual(bullish_low, 79800.0 - 50.0)
+        self.assertLessEqual(bullish_high - bullish_low, 450.0)
+
+        sideways_low, sideways_high = market_predictor.clamp_prediction_range(
+            "SIDEWAYS", 79800.0, 79000.0, 81000.0
+        )
+        self.assertEqual((sideways_low + sideways_high) / 2.0, 79800.0)
+        self.assertLessEqual(sideways_high - sideways_low, 450.0)
+
+    def test_clamp_prediction_range_rejects_invalid_values(self) -> None:
+        for arguments in (
+            ("BULLISH", 0.0, 90.0, 110.0),
+            ("BEARISH", 100.0, 110.0, 90.0),
+            ("SIDEWAYS", 100.0, 90.0, 110.0, 0.0),
+        ):
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                market_predictor.clamp_prediction_range(*arguments)
+
+    def test_bullish_range_is_width_limited_and_anchored_at_current_price(self) -> None:
+        prediction = valid_market_forecast()
+        prediction.update(
+            {
+                "expected_high_next_2h": 81000.0,
+                "expected_low_next_2h": 79000.0,
+                "projected_price_in_2h": 80900.0,
+            }
+        )
+
+        result = market_predictor.validate_prediction(
+            prediction, {"current_price": 79800.0}
+        )
+
+        self.assertEqual(result["expected_low_next_2h"], 79750.0)
+        self.assertGreaterEqual(result["expected_high_next_2h"], 79800.0)
+        self.assertLessEqual(
+            result["expected_high_next_2h"] - result["expected_low_next_2h"],
+            market_predictor.MAX_EXPECTED_RANGE_WIDTH,
+        )
+
+    def test_sideways_and_wait_ranges_are_centered_and_width_limited(self) -> None:
+        for update in (
+            {"predicted_direction": "SIDEWAYS"},
+            {"action": "WAIT"},
+        ):
+            prediction = valid_market_forecast()
+            prediction.update(
+                {
+                    **update,
+                    "expected_high_next_2h": 81000.0,
+                    "expected_low_next_2h": 79000.0,
+                }
+            )
+            with self.subTest(update=update):
+                result = market_predictor.validate_prediction(
+                    prediction, {"current_price": 79800.0}
+                )
+                self.assertEqual(
+                    (result["expected_high_next_2h"] + result["expected_low_next_2h"])
+                    / 2,
+                    79800.0,
+                )
+                self.assertLessEqual(
+                    result["expected_high_next_2h"]
+                    - result["expected_low_next_2h"],
+                    market_predictor.MAX_EXPECTED_RANGE_WIDTH,
+                )
+
+    def test_range_validation_rejects_missing_or_invalid_current_price(self) -> None:
+        for metrics in ({}, {"current_price": float("nan")}, {"current_price": 0}):
+            with self.subTest(metrics=metrics), self.assertRaisesRegex(
+                ValueError, "Current BTC price"
+            ):
+                market_predictor.validate_prediction(valid_market_forecast(), metrics)
+
     def test_forecast_writes_unique_utc_two_hour_record_to_its_own_schema(self) -> None:
         log_file = self.directory / "btc_forecasts_2h.csv"
         issue_time = datetime.datetime(
