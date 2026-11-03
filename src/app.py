@@ -7,7 +7,13 @@ import pandas as pd
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
-from . import chart_engine, data_engine, pro_strategist
+from . import (
+    chart_engine,
+    data_engine,
+    market_predictor,
+    polymarket_paper,
+    pro_strategist,
+)
 from .paths import ASSETS_DIR, PROJECT_ROOT
 from .prediction_logs import (
     ADVISORY_LOG_FIELDS,
@@ -37,11 +43,12 @@ def log_prediction(
     decision_json: dict[str, Any],
     market_context: dict[str, Any],
     spot_data: pd.DataFrame,
+    issue_time: datetime.datetime | None = None,
 ) -> None:
     decision_json = pro_strategist.validate_advisory(decision_json)
     if spot_data.empty:
         raise ValueError("Cannot log a forecast without confirmed BTC candles.")
-    issue_time = utc_now()
+    issue_time = issue_time or utc_now()
     issue_timestamp = to_utc_iso(issue_time)
     source_timestamp = pd.Timestamp(spot_data.index[-1])
     if source_timestamp.tzinfo is None:
@@ -119,7 +126,23 @@ def analyze() -> dict[str, Any] | JSONResponse:
                 full_context,
                 chart_image_path=str(CHART_FILE),
             )
-            log_prediction(decision, market_context, spot_data)
+            issue_time = utc_now()
+            paper_forecast = {
+                **decision,
+                "forecast_issue_timestamp": to_utc_iso(issue_time),
+                "target_timestamp": to_utc_iso(
+                    issue_time + datetime.timedelta(hours=FORECAST_HORIZON_HOURS)
+                ),
+                "forecast_horizon_hours": FORECAST_HORIZON_HOURS,
+            }
+            try:
+                paper_status = polymarket_paper.process_forecast(
+                    paper_forecast, "advisory"
+                )
+            except Exception as exc:
+                paper_status = {"status": "error", "reason": str(exc)}
+            decision["polymarket_paper"] = paper_status
+            log_prediction(decision, market_context, spot_data, issue_time)
             return decision
     except Exception as exc:
         print(f"[API] Analysis failed: {exc}")
@@ -127,6 +150,37 @@ def analyze() -> dict[str, Any] | JSONResponse:
             status_code=502,
             content={
                 "error": "Market analysis failed.",
+                "detail": str(exc),
+            },
+        )
+
+
+@app.get("/api/predict_2h", response_model=None)
+def predict_2h() -> dict[str, Any] | JSONResponse:
+    try:
+        with ANALYSIS_LOCK:
+            forecast = market_predictor.run_predictor("BTC-USD")
+            if not forecast:
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": "2H predictor returned no forecast."},
+                )
+
+            try:
+                paper_status = polymarket_paper.process_forecast(
+                    forecast, "forecast"
+                )
+            except Exception as exc:
+                paper_status = {"status": "error", "reason": str(exc)}
+
+            forecast["polymarket_paper"] = paper_status
+            return forecast
+    except Exception as exc:
+        print(f"[API] 2H Prediction failed: {exc}")
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": "2H Market prediction failed.",
                 "detail": str(exc),
             },
         )

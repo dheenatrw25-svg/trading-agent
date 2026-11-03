@@ -1,27 +1,30 @@
 import csv
 import datetime
+import json
 import math
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
 
-import chromadb
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from .paths import PROJECT_ROOT
+from .paths import TRADE_MEMORIES_DIR
 from .prediction_logs import (
+    ADVISORY_LOG_FIELDS,
+    ADVISORY_LOG_FILE,
     BTC_FORECAST_FIELDS,
     BTC_FORECAST_FILE,
+    initialize_advisory_log,
     initialize_btc_forecast_log,
 )
 
 
-CHROMA_CLIENT = chromadb.PersistentClient(path=str(PROJECT_ROOT / "chroma_db"))
-TRADE_MEMORIES = CHROMA_CLIENT.get_or_create_collection(name="trade_memories")
 FORECAST_HORIZON_HOURS = 2
+ADVISORY_HORIZON_HOURS = 4
 MAX_CLOSE_DELAY = pd.Timedelta(minutes=1)
 
 
@@ -257,16 +260,15 @@ def evaluate_forecast(
     actual_high, actual_low, resolution = _range_extremes(
         issue_time, close_time, candles_15m, candles_1m
     )
-    starting_price = float(row["starting_btc_price"])
     expected_low = float(row["expected_low"])
     expected_high = float(row["expected_high"])
     projected_price = float(row["projected_price"])
     direction = str(row["predicted_direction"]).strip().upper()
 
     if direction == "BULLISH":
-        direction_correct: bool | str = actual_close > starting_price
+        direction_correct: bool | str = actual_high >= expected_low
     elif direction == "BEARISH":
-        direction_correct = actual_close < starting_price
+        direction_correct = actual_low <= expected_high
     else:
         # A SIDEWAYS forecast has no up/down direction; range scores measure it.
         direction_correct = ""
@@ -288,61 +290,103 @@ def evaluate_forecast(
         "evaluation_status": "EVALUATED",
         "evaluation_note": (
             f"Range measured with complete {resolution} OHLC candles overlapping "
-            "the forecast interval; the close uses the exact expiry candle when "
+            "the forecast interval; directional forecasts are scored by whether "
+            "the window reached the predicted target zone. The close uses the exact "
+            "expiry candle when "
             "available, otherwise the latest minute close no more than one minute "
             "before expiry. SIDEWAYS direction is not applicable; use range scores."
         ),
     }
 
 
-def store_memory(row_data: dict[str, Any]) -> None:
+def _memory_id(row_data: dict[str, Any]) -> str:
     forecast_id = str(row_data.get("forecast_id", "")).strip()
-    if not forecast_id:
-        raise ValueError("Cannot store a forecast memory without a forecast ID.")
-    document = (
-        f"Forecast {forecast_id}: {row_data['predicted_direction']} BTC forecast. "
-        f"Starting price {row_data['starting_btc_price']}; predicted range "
-        f"{row_data['expected_low']} to {row_data['expected_high']}; projected "
-        f"price {row_data['projected_price']}. Scenario: {row_data['scenario']} "
-        f"Actual close {row_data['actual_btc_close']} at "
-        f"{row_data['actual_close_timestamp']}; actual high/low "
-        f"{row_data['actual_high']}/{row_data['actual_low']}. Direction correct: "
-        f"{row_data['direction_correct']}; final close inside range: "
-        f"{row_data['final_close_in_predicted_range']}; full-period range inside: "
-        f"{row_data['full_period_range_inside_predicted_range']}."
+    if forecast_id:
+        return forecast_id
+    issue_timestamp = str(
+        row_data.get("forecast_issue_timestamp") or row_data.get("timestamp") or ""
+    ).strip()
+    if not issue_timestamp:
+        raise ValueError("Cannot store a forecast memory without an issue timestamp.")
+    return f"advisory-{issue_timestamp}"
+
+
+def _memory_file_path(row_data: dict[str, Any], memory_id: str) -> Path:
+    timestamp = _utc_timestamp(
+        row_data.get("forecast_issue_timestamp") or row_data.get("timestamp")
     )
-    TRADE_MEMORIES.upsert(
-        ids=[forecast_id],
-        documents=[document],
-        metadatas=[
-            {
-                "forecast_id": forecast_id,
-                "direction": str(row_data["predicted_direction"]),
-                "evaluation_status": str(row_data["evaluation_status"]),
-            }
-        ],
+    date = timestamp.strftime("%Y-%m-%d")
+    ticker = str(row_data.get("ticker") or "BTC-USD").strip().upper()
+    ticker = re.sub(r"[^A-Z0-9.-]+", "_", ticker.split("-", 1)[0]) or "UNKNOWN"
+    direction = str(
+        row_data.get("predicted_direction") or row_data.get("direction") or "UNKNOWN"
+    ).strip().upper()
+    direction = {"BULLISH": "UP", "BEARISH": "DOWN"}.get(direction, direction)
+    direction = re.sub(r"[^A-Z0-9_-]+", "_", direction) or "UNKNOWN"
+    base_path = TRADE_MEMORIES_DIR / f"{date}_{ticker}_{direction}.md"
+    for existing_path in TRADE_MEMORIES_DIR.glob(f"{base_path.stem}*.md"):
+        if f"Memory ID: `{memory_id}`" in existing_path.read_text(encoding="utf-8"):
+            return existing_path
+    if not base_path.exists():
+        return base_path
+    safe_id = re.sub(r"[^A-Za-z0-9_-]+", "_", memory_id)
+    return TRADE_MEMORIES_DIR / f"{base_path.stem}_{safe_id}.md"
+
+
+def store_memory(row_data: dict[str, Any], outcome_reason: str | None = None) -> None:
+    memory_id = _memory_id(row_data)
+    reason = outcome_reason or str(row_data.get("outcome_reason", "")).strip()
+    if not reason:
+        raise ValueError("Cannot store a forecast memory without its outcome reason.")
+    TRADE_MEMORIES_DIR.mkdir(parents=True, exist_ok=True)
+    memory_path = _memory_file_path(row_data, memory_id)
+    context = json.dumps(row_data, indent=2, ensure_ascii=False, default=str)
+    memory = (
+        f"# {row_data.get('ticker', 'BTC-USD')} "
+        f"{row_data.get('predicted_direction') or row_data.get('direction', '')} "
+        "forecast\n\n"
+        f"**Memory ID:** `{memory_id}`\n\n"
+        "## Outcome\n\n"
+        f"{reason}\n\n"
+        "## Full forecast and evaluation context\n\n"
+        "```json\n"
+        f"{context}\n"
+        "```\n"
     )
+    memory_path.write_text(memory, encoding="utf-8")
 
 
 def retrieve_past_lessons(current_market_regime: str) -> str:
     if not current_market_regime.strip():
         raise ValueError("current_market_regime must not be empty.")
-    memory_count = TRADE_MEMORIES.count()
-    if memory_count == 0:
+    memories = sorted(
+        TRADE_MEMORIES_DIR.glob("*.md"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not memories:
         return "No past trade lessons are available yet."
-    results = TRADE_MEMORIES.query(
-        query_texts=[current_market_regime],
-        n_results=min(3, memory_count),
-    )
-    documents = results.get("documents", [[]])[0]
-    if not documents:
-        return "No relevant past trade lessons were found."
-    return "\n".join(
-        f"{index}. {document}" for index, document in enumerate(documents, start=1)
+    terms = {
+        term.casefold()
+        for term in re.findall(r"[A-Za-z0-9_-]{3,}", current_market_regime)
+    }
+    ranked_memories: list[tuple[int, float, Path, str]] = []
+    for memory_path in memories:
+        document = memory_path.read_text(encoding="utf-8")
+        score = sum(document.casefold().count(term) for term in terms)
+        ranked_memories.append((score, memory_path.stat().st_mtime, memory_path, document))
+    ranked_memories.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return "\n\n".join(
+        f"### Past trade lesson {index}\n\n{document}"
+        for index, (_, _, _, document) in enumerate(ranked_memories[:3], start=1)
     )
 
 
-def _write_rows_atomic(path: Path, rows: list[dict[str, str]]) -> None:
+def _write_rows_atomic(
+    path: Path,
+    rows: list[dict[str, str]],
+    fields: list[str] = BTC_FORECAST_FIELDS,
+) -> None:
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.stem}-",
         suffix=".tmp",
@@ -351,7 +395,7 @@ def _write_rows_atomic(path: Path, rows: list[dict[str, str]]) -> None:
     )
     try:
         with os.fdopen(descriptor, "w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=BTC_FORECAST_FIELDS, extrasaction="raise")
+            writer = csv.DictWriter(file, fieldnames=fields, extrasaction="raise")
             writer.writeheader()
             writer.writerows(rows)
         Path(temporary_name).replace(path)
@@ -415,7 +459,10 @@ def grade_pending_predictions(
             )
             result = evaluate_forecast(row, candles_15m, candles_1m)
             evaluated_row = {**row, **{key: str(value) for key, value in result.items()}}
-            store_memory(evaluated_row)
+            store_memory(
+                evaluated_row,
+                outcome_reason=_two_hour_outcome_reason(evaluated_row),
+            )
             row.update(evaluated_row)
             summary["graded"] += 1
             summary["memorized"] += 1
@@ -437,11 +484,203 @@ def grade_pending_predictions(
     return summary
 
 
-if __name__ == "__main__":
-    result = grade_pending_predictions()
-    print(
-        "[EVALUATOR] "
-        f"{result['graded']} evaluated, {result['memorized']} memories upserted, "
-        f"{result['pending']} pending, {result['needs_review']} need review, "
-        f"{result['errors']} errors."
+def _two_hour_outcome_reason(row: dict[str, Any]) -> str:
+    direction = str(row["predicted_direction"]).strip().upper()
+    correct = str(row["direction_correct"]).strip().casefold() == "true"
+    final_in_range = (
+        str(row["final_close_in_predicted_range"]).strip().casefold() == "true"
     )
+    if direction == "SIDEWAYS":
+        won = final_in_range
+        directional_detail = (
+            "The final close landed inside the predicted range."
+            if final_in_range
+            else "The final close landed outside the predicted range."
+        )
+    else:
+        won = correct
+        directional_detail = (
+            f"The {direction} forecast was correct: actual close "
+            f"{row['actual_btc_close']} versus starting price "
+            f"{row['starting_btc_price']}."
+            if correct
+            else f"The {direction} forecast was incorrect: actual close "
+            f"{row['actual_btc_close']} versus starting price "
+            f"{row['starting_btc_price']}."
+        )
+    verdict = "WON" if won else "LOST"
+    return (
+        f"**{verdict}.** {directional_detail} The final close was "
+        f"{'inside' if final_in_range else 'outside'} the predicted range "
+        f"{row['expected_low']}–{row['expected_high']}; actual high/low were "
+        f"{row['actual_high']}/{row['actual_low']}."
+    )
+
+
+def _validate_advisory_timestamps(
+    row: dict[str, Any],
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    issue_time = _utc_timestamp(
+        row.get("forecast_issue_timestamp") or row.get("timestamp")
+    )
+    source_time = _utc_timestamp(row.get("source_candle_timestamp"))
+    target_time = _utc_timestamp(row.get("target_timestamp"))
+    try:
+        horizon = float(row.get("forecast_horizon_hours"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Advisory forecast horizon is missing or invalid.") from exc
+    if horizon != ADVISORY_HORIZON_HOURS:
+        raise ValueError("Only fixed four-hour BTC advisories can be evaluated.")
+    if source_time > issue_time:
+        raise ValueError("Source candle close is later than the advisory issue time.")
+    if target_time != issue_time + pd.Timedelta(hours=ADVISORY_HORIZON_HOURS):
+        raise ValueError("Advisory target timestamp does not match the four-hour horizon.")
+    _positive_number(row.get("btc_price_at_prediction"), "Starting BTC price")
+    low = _positive_number(row.get("target_low"), "Target low")
+    high = _positive_number(row.get("target_high"), "Target high")
+    if low > high:
+        raise ValueError("Advisory target low exceeds target high.")
+    direction = str(row.get("direction", "")).strip().upper()
+    if direction not in {"UP", "DOWN"}:
+        raise ValueError("Advisory direction is invalid.")
+    return issue_time, target_time
+
+
+def evaluate_advisory(
+    row: dict[str, Any],
+    candles_15m: pd.DataFrame,
+    candles_1m: pd.DataFrame,
+) -> dict[str, Any]:
+    issue_time, target_time = _validate_advisory_timestamps(row)
+    actual_close, close_time = _target_close(target_time, candles_15m, candles_1m)
+    actual_high, actual_low, resolution = _range_extremes(
+        issue_time, close_time, candles_15m, candles_1m
+    )
+    direction = str(row["direction"]).strip().upper()
+    target_low = float(row["target_low"])
+    target_high = float(row["target_high"])
+    correct = (
+        actual_high >= target_low
+        if direction == "UP"
+        else actual_low <= target_high
+    )
+    in_range = float(row["target_low"]) <= actual_close <= float(row["target_high"])
+    verdict = "WON" if correct else "LOST"
+    touch_reason = (
+        f"actual high {actual_high} "
+        f"{'reached or exceeded' if correct else 'did not reach'} target low {target_low}"
+        if direction == "UP"
+        else f"actual low {actual_low} "
+        f"{'reached or fell below' if correct else 'did not reach'} target high {target_high}"
+    )
+    reason = (
+        f"{verdict}: {direction} forecast was "
+        f"{'correct' if correct else 'incorrect'} because {touch_reason}. "
+        f"Actual BTC close was {actual_close} and was "
+        f"{'inside' if in_range else 'outside'} target range "
+        f"{row['target_low']}–{row['target_high']}; actual high/low were "
+        f"{actual_high}/{actual_low}."
+    )
+    return {
+        "actual_price_timestamp": close_time.isoformat(),
+        "actual_outcome": reason,
+        "graded": "True",
+        "actual_btc_close": actual_close,
+        "actual_high": actual_high,
+        "actual_low": actual_low,
+        "direction_correct": correct,
+        "final_close_in_predicted_range": in_range,
+        "evaluation_note": (
+            f"Range measured with complete {resolution} OHLC candles overlapping "
+            "the four-hour advisory interval."
+        ),
+    }
+
+
+def grade_pending_advisories(
+    csv_file: str | Path = ADVISORY_LOG_FILE,
+    now: pd.Timestamp | None = None,
+) -> dict[str, int]:
+    path = Path(csv_file)
+    initialize_advisory_log(path)
+    with path.open("r", newline="", encoding="utf-8-sig") as file:
+        reader = csv.DictReader(file)
+        if reader.fieldnames != ADVISORY_LOG_FIELDS:
+            raise ValueError(
+                f"Advisory log {path} has an unexpected schema; it was not evaluated."
+            )
+        rows = list(reader)
+
+    now_utc = _utc_timestamp(now) if now is not None else pd.Timestamp.now(tz="UTC")
+    summary = {"graded": 0, "memorized": 0, "errors": 0, "pending": 0, "needs_review": 0}
+    changed = False
+    for row in rows:
+        if row.get("graded", "").strip().casefold() not in {"false", "pending"}:
+            continue
+        try:
+            issue_time, target_time = _validate_advisory_timestamps(row)
+            if target_time > now_utc:
+                summary["pending"] += 1
+                continue
+        except (TypeError, ValueError) as exc:
+            row["graded"] = "NEEDS_REVIEW"
+            row["actual_outcome"] = str(exc)
+            summary["needs_review"] += 1
+            changed = True
+            continue
+
+        try:
+            candles_15m, candles_1m = _fetch_evaluation_candles(
+                "BTC-USD", issue_time, target_time
+            )
+            candles_15m = _completed_candles(
+                candles_15m, pd.Timedelta(minutes=15), now_utc
+            )
+            candles_1m = _completed_candles(
+                candles_1m, pd.Timedelta(minutes=1), now_utc
+            )
+            result = evaluate_advisory(row, candles_15m, candles_1m)
+            memory_data = {**row, **{key: str(value) for key, value in result.items()}}
+            memory_data["ticker"] = "BTC-USD"
+            store_memory(memory_data, outcome_reason=str(result["actual_outcome"]))
+            row.update(
+                {
+                    key: str(result[key])
+                    for key in ("actual_price_timestamp", "actual_outcome", "graded")
+                }
+            )
+            summary["graded"] += 1
+            summary["memorized"] += 1
+            changed = True
+        except EvaluationDataUnavailable as exc:
+            row["actual_outcome"] = f"Pending: {exc}"
+            summary["pending"] += 1
+            changed = True
+            print(f"[EVALUATOR] Advisory {row.get('forecast_issue_timestamp')}: {exc}")
+        except Exception as exc:
+            summary["errors"] += 1
+            print(
+                f"[EVALUATOR] Could not evaluate advisory "
+                f"{row.get('forecast_issue_timestamp')}: {exc}"
+            )
+    if changed:
+        _write_rows_atomic(path, rows, ADVISORY_LOG_FIELDS)
+    return summary
+
+
+if __name__ == "__main__":
+    for log_name, grade in (
+        ("2-hour forecasts", grade_pending_predictions),
+        ("4-hour advisories", grade_pending_advisories),
+    ):
+        try:
+            result = grade()
+        except Exception as exc:
+            print(f"[EVALUATOR] Could not process {log_name}: {exc}")
+            continue
+        print(
+            f"[EVALUATOR] {log_name}: "
+            f"{result['graded']} evaluated, {result['memorized']} memories written, "
+            f"{result['pending']} pending, {result['needs_review']} need review, "
+            f"{result['errors']} errors."
+        )

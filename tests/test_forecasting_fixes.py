@@ -625,19 +625,30 @@ class ForecastLoggingAndEvaluationTests(unittest.TestCase):
 
     def test_direction_close_range_and_price_error_are_scored_separately(self) -> None:
         issue = pd.Timestamp("2026-01-01T12:00:00+00:00")
-        candles_15m, candles_1m = candle_data(issue, close_price=108.0)
+        candles_15m, candles_1m = candle_data(issue, close_price=99.0)
+        bullish = forecast_row(issue, "BULLISH")
+        bullish["expected_low"] = "105"
         result = evaluator.evaluate_forecast(
-            forecast_row(issue, "BULLISH"), candles_15m, candles_1m
+            bullish, candles_15m, candles_1m
         )
         self.assertTrue(result["direction_correct"])
-        self.assertTrue(result["final_close_in_predicted_range"])
-        self.assertTrue(result["full_period_range_inside_predicted_range"])
-        self.assertEqual(result["projected_price_absolute_error"], 3.0)
-        self.assertAlmostEqual(result["projected_price_percentage_error"], 100 * 3 / 105)
+        self.assertFalse(result["final_close_in_predicted_range"])
+        self.assertFalse(result["full_period_range_inside_predicted_range"])
+        self.assertEqual(result["projected_price_absolute_error"], 6.0)
+        self.assertAlmostEqual(result["projected_price_percentage_error"], 100 * 6 / 105)
         self.assertEqual(result["actual_close_timestamp"], (issue + pd.Timedelta(hours=2)).isoformat())
 
+        bearish_touch = forecast_row(issue, "BEARISH")
+        bearish_touch["expected_high"] = "95"
+        touched = evaluator.evaluate_forecast(
+            bearish_touch, candles_15m, candles_1m
+        )
+        self.assertTrue(touched["direction_correct"])
+
+        bearish_miss = forecast_row(issue, "BEARISH")
+        bearish_miss["expected_high"] = "94"
         wrong = evaluator.evaluate_forecast(
-            forecast_row(issue, "BEARISH"), candles_15m, candles_1m
+            bearish_miss, candles_15m, candles_1m
         )
         self.assertFalse(wrong["direction_correct"])
 
@@ -710,7 +721,7 @@ class ForecastLoggingAndEvaluationTests(unittest.TestCase):
         with path.open(newline="", encoding="utf-8") as file:
             self.assertEqual(next(csv.DictReader(file))["evaluation_status"], "PENDING")
 
-    def test_csv_is_updated_once_and_rag_upsert_uses_forecast_id(self) -> None:
+    def test_csv_is_updated_once_and_markdown_memory_is_written(self) -> None:
         path = self.directory / "btc.csv"
         prediction_logs.initialize_btc_forecast_log(path)
         issue = pd.Timestamp("2026-01-01T12:00:00+00:00")
@@ -737,7 +748,7 @@ class ForecastLoggingAndEvaluationTests(unittest.TestCase):
         self.assertEqual(saved["actual_btc_close"], "108.0")
         self.assertEqual(saved["final_close_in_predicted_range"], "True")
 
-    def test_rag_memory_upserts_by_stable_forecast_id(self) -> None:
+    def test_markdown_memory_is_stable_and_retrievable(self) -> None:
         row = forecast_row(pd.Timestamp("2026-01-01T12:00:00+00:00"))
         row.update(
             {
@@ -751,17 +762,105 @@ class ForecastLoggingAndEvaluationTests(unittest.TestCase):
                 "evaluation_status": "EVALUATED",
             }
         )
-        with patch.object(evaluator, "TRADE_MEMORIES") as collection:
-            evaluator.store_memory(row)
-            evaluator.store_memory(row)
-        self.assertEqual(collection.upsert.call_count, 2)
-        self.assertEqual(collection.upsert.call_args_list[0].kwargs["ids"], [
-            row["forecast_id"]
-        ])
-        self.assertEqual(
-            collection.upsert.call_args_list[1].kwargs["ids"],
-            [row["forecast_id"]],
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            memory_dir = Path(temporary_directory)
+            with patch.object(evaluator, "TRADE_MEMORIES_DIR", memory_dir):
+                evaluator.store_memory(row, outcome_reason="WON: direction correct.")
+                evaluator.store_memory(row, outcome_reason="WON: direction correct.")
+                memory_file = memory_dir / "2026-01-01_BTC_UP.md"
+                self.assertTrue(memory_file.is_file())
+                content = memory_file.read_text(encoding="utf-8")
+                self.assertIn("WON: direction correct.", content)
+                self.assertIn("Test forecast scenario.", content)
+                self.assertIn(row["forecast_id"], content)
+                lessons = evaluator.retrieve_past_lessons("BTC bullish")
+                self.assertIn(content, lessons)
+                self.assertIn("Past trade lesson", lessons)
+
+    def test_four_hour_advisory_log_is_graded_and_memorized(self) -> None:
+        path = self.directory / "advisory_log.csv"
+        prediction_logs.initialize_advisory_log(path)
+        issue = pd.Timestamp("2026-01-01T12:00:00+00:00")
+        row = {
+            "timestamp": issue.isoformat(),
+            "forecast_issue_timestamp": issue.isoformat(),
+            "source_candle_timestamp": (issue - pd.Timedelta(hours=4)).isoformat(),
+            "target_timestamp": (issue + pd.Timedelta(hours=4)).isoformat(),
+            "forecast_horizon_hours": "4",
+            "btc_price_at_prediction": "100",
+            "direction": "UP",
+            "target_low": "105",
+            "target_high": "110",
+            "invalidation_price": "85",
+            "confidence": "7",
+            "graded": "False",
+            "actual_price_timestamp": "",
+            "actual_outcome": "Pending",
+            "market_regime": "Trend continuation",
+            "reasoning": "Completed candles support an upside forecast.",
+        }
+        with path.open("a", newline="", encoding="utf-8") as file:
+            csv.DictWriter(file, fieldnames=prediction_logs.ADVISORY_LOG_FIELDS).writerow(row)
+        candles_15m = pd.DataFrame(
+            {
+                "Open": [100.0] * 16,
+                "High": [109.0] * 16,
+                "Low": [95.0] * 16,
+                "Close": [101.0] * 15 + [99.0],
+            },
+            index=pd.date_range(issue, periods=16, freq="15min"),
         )
+        candles_1m = pd.DataFrame(
+            {
+                "Open": [100.0] * 240,
+                "High": [109.0] * 240,
+                "Low": [95.0] * 240,
+                "Close": [101.0] * 239 + [99.0],
+            },
+            index=pd.date_range(issue, periods=240, freq="min"),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with (
+                patch.object(
+                    evaluator,
+                    "_fetch_evaluation_candles",
+                    return_value=(candles_15m, candles_1m),
+                ),
+                patch.object(
+                    evaluator, "TRADE_MEMORIES_DIR", Path(temporary_directory)
+                ),
+            ):
+                summary = evaluator.grade_pending_advisories(
+                    path, now=issue + pd.Timedelta(hours=5)
+                )
+            self.assertEqual(summary["graded"], 1)
+            with path.open(newline="", encoding="utf-8") as file:
+                saved = next(csv.DictReader(file))
+            self.assertEqual(saved["graded"], "True")
+            self.assertIn("WON", saved["actual_outcome"])
+            self.assertIn("outside target range", saved["actual_outcome"])
+            self.assertIn("reached or exceeded target low 105.0", saved["actual_outcome"])
+            self.assertIn("Actual BTC close was 99.0", saved["actual_outcome"])
+
+            down_row = dict(
+                row, direction="DOWN", target_low="90", target_high="96"
+            )
+            down_candles_15m = candles_15m.copy()
+            down_candles_1m = candles_1m.copy()
+            down_candles_15m.iloc[-1, down_candles_15m.columns.get_loc("Close")] = 101.0
+            down_candles_1m.iloc[-1, down_candles_1m.columns.get_loc("Close")] = 101.0
+            down_result = evaluator.evaluate_advisory(
+                down_row, down_candles_15m, down_candles_1m
+            )
+            self.assertIn("WON", down_result["actual_outcome"])
+            self.assertIn(
+                "reached or fell below target high 96.0",
+                down_result["actual_outcome"],
+            )
+            self.assertIn("Actual BTC close was 101.0", down_result["actual_outcome"])
+            memory_file = Path(temporary_directory) / "2026-01-01_BTC_UP.md"
+            self.assertTrue(memory_file.is_file())
+            self.assertIn("Completed candles support", memory_file.read_text(encoding="utf-8"))
 
     def test_unreliable_legacy_row_gets_needs_review_not_a_fake_grade(self) -> None:
         path = self.directory / "btc.csv"

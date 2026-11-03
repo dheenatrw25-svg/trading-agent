@@ -4,7 +4,14 @@ from pathlib import Path
 
 import schedule
 
-from . import chart_engine, data_engine, evaluator, market_predictor, pro_strategist
+from . import (
+    chart_engine,
+    data_engine,
+    evaluator,
+    market_predictor,
+    polymarket_paper,
+    pro_strategist,
+)
 from .prediction_logs import (
     ADVISORY_LOG_FIELDS,
     ADVISORY_LOG_FILE,
@@ -96,6 +103,11 @@ def run_agent_pipeline() -> None:
         }
         append_forecast_result(result_row, FORECAST_HORIZON_HOURS)
         print(f"[GATEKEEPER] Advisory logged to {CSV_FILENAME}.")
+        try:
+            result = polymarket_paper.process_forecast(row, "advisory")
+            print(f"[POLYMARKET PAPER] 4H advisory: {result['status']}.")
+        except Exception as exc:
+            print(f"[POLYMARKET PAPER] 4H advisory processing failed: {exc}")
     except Exception as exc:
         print(f"[GATEKEEPER] Pipeline failed: {exc}")
 
@@ -106,18 +118,45 @@ def run_market_prediction() -> None:
         f"{datetime.datetime.now().strftime('%H:%M:%S')} ---"
     )
     try:
-        market_predictor.run_predictor("BTC-USD")
+        forecast = market_predictor.run_predictor("BTC-USD")
+        if forecast:
+            try:
+                result = polymarket_paper.process_forecast(forecast, "forecast")
+                print(f"[POLYMARKET PAPER] 2H forecast: {result['status']}.")
+            except Exception as exc:
+                print(f"[POLYMARKET PAPER] 2H forecast processing failed: {exc}")
     except Exception as exc:
         print(f"Error during prediction: {exc}")
-    try:
-        result = evaluator.grade_pending_predictions()
+    results = []
+    for label, grade in (
+        ("2-hour forecasts", evaluator.grade_pending_predictions),
+        ("4-hour advisories", evaluator.grade_pending_advisories),
+    ):
+        try:
+            results.append(grade())
+        except Exception as exc:
+            print(f"Error during {label} evaluation: {exc}")
+    if results:
         print(
             "[EVALUATOR] "
-            f"{result['graded']} evaluated, {result['pending']} pending, "
-            f"{result['needs_review']} need review, {result['errors']} errors."
+            f"{sum(result['graded'] for result in results)} evaluated, "
+            f"{sum(result['pending'] for result in results)} pending, "
+            f"{sum(result['needs_review'] for result in results)} need review, "
+            f"{sum(result['errors'] for result in results)} errors."
         )
+
+
+def settle_polymarket_positions() -> None:
+    try:
+        result = polymarket_paper.settle_open_positions()
+        if result["settled"] or result["pending"]:
+            print(
+                "[POLYMARKET PAPER] "
+                f"{result['settled']} positions settled, "
+                f"{result['pending']} awaiting confirmed resolution."
+            )
     except Exception as exc:
-        print(f"Error during forecast evaluation: {exc}")
+        print(f"[POLYMARKET PAPER] Settlement check failed: {exc}")
 
 
 if __name__ == "__main__":
@@ -126,6 +165,7 @@ if __name__ == "__main__":
     run_market_prediction()
     schedule.every(4).hours.do(run_agent_pipeline)
     schedule.every(60).minutes.do(run_market_prediction)
+    schedule.every(1).minutes.do(settle_polymarket_positions)
 
     print("Starting trading agent and hourly predictor scheduler.")
     print("Leave this terminal open. Press Ctrl+C to stop.")

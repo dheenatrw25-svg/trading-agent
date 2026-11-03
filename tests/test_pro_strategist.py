@@ -97,6 +97,79 @@ class PlaybookTests(unittest.TestCase):
         self.assertIsInstance(contents[5], Image.Image)
         self.assertEqual(request["model"], "gemini-3.8-flash")
 
+    def test_busy_gemini_response_retries_with_exponential_backoff(self) -> None:
+        client = Mock()
+        client.models.generate_content.side_effect = [
+            RuntimeError("503 UNAVAILABLE: high demand"),
+            RuntimeError("429 rate limited"),
+            Mock(text=json.dumps(valid_advisory())),
+        ]
+        market_context = {
+            "spot": {"current_close": 100.0},
+            "current_price": 100.0,
+            "technical_indicators": {},
+            "institutional_order_flow": {},
+        }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "chart.png"
+            Image.new("RGB", (4, 4)).save(image_path)
+            with (
+                patch.object(pro_strategist, "load_playbook", return_value="PLAYBOOK"),
+                patch.object(
+                    pro_strategist, "retrieve_past_lessons", return_value="LESSONS"
+                ),
+                patch.object(pro_strategist.genai, "Client", return_value=client),
+                patch.object(pro_strategist.time, "sleep") as sleep,
+                patch("builtins.print") as print_call,
+            ):
+                result = pro_strategist.generate_trading_advisory(
+                    market_context, str(image_path)
+                )
+
+        self.assertEqual(result["direction"], "UP")
+        self.assertEqual(client.models.generate_content.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [5, 10])
+        self.assertEqual(
+            [call.args[0] for call in print_call.call_args_list],
+            [
+                "[API] Gemini servers busy. Retrying attempt 1/3 in 5 seconds...",
+                "[API] Gemini servers busy. Retrying attempt 2/3 in 10 seconds...",
+            ],
+        )
+
+    def test_unrecoverable_gemini_error_is_not_retried(self) -> None:
+        client = Mock()
+        client.models.generate_content.side_effect = RuntimeError("invalid API key")
+        market_context = {
+            "spot": {"current_close": 100.0},
+            "current_price": 100.0,
+            "technical_indicators": {},
+            "institutional_order_flow": {},
+        }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "chart.png"
+            Image.new("RGB", (4, 4)).save(image_path)
+            with (
+                patch.object(pro_strategist, "load_playbook", return_value="PLAYBOOK"),
+                patch.object(
+                    pro_strategist, "retrieve_past_lessons", return_value="LESSONS"
+                ),
+                patch.object(pro_strategist.genai, "Client", return_value=client),
+                patch.object(pro_strategist.time, "sleep") as sleep,
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "Gemini 4-hour forecast request failed: invalid API key",
+                ),
+            ):
+                pro_strategist.generate_trading_advisory(
+                    market_context, str(image_path)
+                )
+
+        client.models.generate_content.assert_called_once()
+        sleep.assert_not_called()
+
     def test_system_prompt_explains_wall_and_taker_divergence_rules(self) -> None:
         self.assertIn("Do not set a target beyond a nearby opposing wall", pro_strategist.PRO_TRADER_PROMPT)
         self.assertIn("never invent a fixed offset", pro_strategist.PRO_TRADER_PROMPT)
@@ -179,6 +252,54 @@ class DirectionAndRiskTests(unittest.TestCase):
         )
         self.assertEqual(result["confidence_score"], 6)
         self.assertIn("reduced by at least two points", result["reasoning"])
+
+    def test_crowded_funding_reduces_down_confidence_by_two(self) -> None:
+        advisory = valid_advisory("DOWN")
+        advisory.update(
+            {
+                "target_range_low": 80.0,
+                "target_range_high": 90.0,
+                "target_price": 85.0,
+                "invalidation_price": 110.0,
+            }
+        )
+        context = {
+            "spot": {"current_close": 100.0},
+            "macro": {"dxy_daily_change_pct": 0.0},
+            "derivatives": {
+                "annualized_funding_rate_pct": -15.1,
+                "open_interest_trend": "rising",
+            },
+            "price_action": {"volume_comparison": {"volume_state": "flat"}},
+        }
+        result = pro_strategist._apply_python_strategy_checks(advisory, context)
+        self.assertEqual(result["confidence_score"], 6)
+        self.assertIn("Crowded-short warning", result["reasoning"])
+        self.assertIn("squeeze risk", result["reasoning"])
+
+    def test_crashing_dxy_caps_down_confidence(self) -> None:
+        advisory = valid_advisory("DOWN")
+        advisory.update(
+            {
+                "target_range_low": 80.0,
+                "target_range_high": 90.0,
+                "target_price": 85.0,
+                "invalidation_price": 110.0,
+            }
+        )
+        context = {
+            "spot": {"current_close": 100.0},
+            "macro": {"dxy_daily_change_pct": -0.40},
+            "derivatives": {
+                "annualized_funding_rate_pct": 0.0,
+                "open_interest_trend": "rising",
+            },
+            "price_action": {"volume_comparison": {"volume_state": "flat"}},
+        }
+        result = pro_strategist._apply_python_strategy_checks(advisory, context)
+        self.assertEqual(result["confidence_score"], 5)
+        self.assertIn("Aggressively falling DXY", result["reasoning"])
+        self.assertIn("short squeeze", result["reasoning"])
 
     def test_unclear_non_actionable_setup_keeps_direction_and_low_confidence(self) -> None:
         advisory = valid_advisory("DOWN")
@@ -339,8 +460,10 @@ class MarketContextTests(unittest.TestCase):
             {
                 "largest_buy_wall_price": 64900.0,
                 "largest_buy_wall_usd": "$129,800",
+                "largest_buy_wall_meets_institutional_threshold": False,
                 "largest_sell_wall_price": 65200.0,
                 "largest_sell_wall_usd": "$78,240",
+                "largest_sell_wall_meets_institutional_threshold": False,
                 "cvd_status": "Neutral/Choppy",
                 "open_interest_trend": "Unavailable",
             },
@@ -361,7 +484,11 @@ class MarketContextTests(unittest.TestCase):
         result = data_engine._build_institutional_order_flow(
             {
                 "largest_buy_wall": {"price_usd": 81000.0, "notional_usd": 45_000_000},
-                "largest_sell_wall": {"price_usd": 81500.0, "notional_usd": 52_000_000},
+                "largest_sell_wall": {
+                    "price_usd": 81500.0,
+                    "notional_usd": 52_000_000,
+                    "meets_institutional_threshold": True,
+                },
             },
             {
                 "taker_pressure_status": "Aggressive Ask Hitting (Bearish CVD)",
@@ -372,6 +499,8 @@ class MarketContextTests(unittest.TestCase):
         self.assertEqual(result["largest_buy_wall_usd"], "$45,000,000")
         self.assertEqual(result["largest_sell_wall_price"], 81500.0)
         self.assertEqual(result["largest_sell_wall_usd"], "$52,000,000")
+        self.assertFalse(result["largest_buy_wall_meets_institutional_threshold"])
+        self.assertTrue(result["largest_sell_wall_meets_institutional_threshold"])
         self.assertEqual(
             result["cvd_status"], "Aggressive Market Selling (Bearish CVD)"
         )
@@ -410,7 +539,7 @@ class MarketContextTests(unittest.TestCase):
         self.assertEqual(indicators["current_price"], close[-1])
         self.assertEqual(indicators["rsi_15m"], 100.0)
 
-    def test_order_book_walls_use_depth_1000_and_report_largest_levels(self) -> None:
+    def test_order_book_walls_use_depth_1000_and_report_largest_bins(self) -> None:
         response = Mock()
         response.raise_for_status.return_value = None
         response.json.return_value = {
@@ -426,24 +555,35 @@ class MarketContextTests(unittest.TestCase):
             timeout=data_engine.REQUEST_TIMEOUT_SECONDS,
         )
         self.assertEqual(context["depth_limit"], 1000)
-        self.assertEqual(
-            context["largest_buy_wall"],
-            {
-                "price_usd": 64900.0,
-                "quantity_btc": 2.0,
-                "notional_usd": 129800.0,
-            },
-        )
-        self.assertEqual(
-            context["largest_sell_wall"],
-            {
-                "price_usd": 65200.0,
-                "quantity_btc": 1.2,
-                "notional_usd": 78240.0,
-            },
-        )
+        self.assertEqual(context["largest_buy_wall"]["price_usd"], 64900.0)
+        self.assertEqual(context["largest_buy_wall"]["quantity_btc"], 2.0)
+        self.assertEqual(context["largest_buy_wall"]["notional_usd"], 129800.0)
+        self.assertEqual(context["largest_sell_wall"]["price_usd"], 65200.0)
+        self.assertEqual(context["largest_sell_wall"]["quantity_btc"], 1.2)
+        self.assertEqual(context["largest_sell_wall"]["notional_usd"], 78240.0)
+        self.assertEqual(context["price_bin_width_usd"], 10.0)
+        self.assertEqual(context["search_radius_usd"], 2000.0)
+        self.assertEqual(context["observed_distance_from_midpoint_usd"], 250.0)
         self.assertTrue(context["snapshot_timestamp_utc"])
         self.assertIn("cannot", context["interpretation_note"])
+
+    def test_order_book_walls_aggregate_bins_into_institutional_notional(self) -> None:
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "bids": [["65000", "10"], ["65005", "10"]],
+            "asks": [["65010", "10"], ["65015", "10"]],
+        }
+        with patch.object(data_engine.requests, "get", return_value=response):
+            context = data_engine.fetch_order_book_walls("BTCUSDT")
+        self.assertEqual(context["largest_buy_wall"]["quantity_btc"], 20.0)
+        self.assertEqual(context["largest_buy_wall"]["notional_usd"], 1_300_050.0)
+        self.assertTrue(
+            context["largest_buy_wall"]["meets_institutional_threshold"]
+        )
+        self.assertTrue(
+            context["largest_sell_wall"]["meets_institutional_threshold"]
+        )
 
     def test_order_book_walls_reject_malformed_levels(self) -> None:
         response = Mock()

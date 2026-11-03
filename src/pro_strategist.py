@@ -27,6 +27,7 @@ YOUR CONFLUENCE RUBRIC:
 - Use only completed four-hour candles; a wick alone does not confirm breakout, reclaim, or rejection.
 - Apply the supplied macro, volume, funding, open-interest, setup, and reward/risk rules. Do not infer open-interest change from a single snapshot or fabricate unavailable data.
 - Treat order-book walls as displayed liquidity in one timestamped snapshot, not proof of persistent support/resistance or spoofing.
+- Treat a binned order-book level as an institutional wall only when its supplied notional meets the $1M threshold; account for the reported snapshot coverage before drawing conclusions about farther levels.
 - Treat taker-volume pressure as a short-term flow proxy, not a guarantee of continued price direction.
 - Liquidity awareness: consider a nearby sell wall as potential overhead resistance for an UP forecast and a nearby buy wall as potential support for a DOWN forecast. Do not set a target beyond a nearby opposing wall unless supplied price-action evidence shows it was absorbed or cleared. If a target is placed before a wall, use a level grounded in supplied market data; never invent a fixed offset from the wall. A wall is not a guaranteed barrier, and it must not override completed-candle confirmation or the playbook's risk/reward rules.
 - Trap avoidance: compare taker-pressure status with completed-candle price action. If price rises while taker pressure is aggressively selling, or price falls while taker pressure is aggressively buying, explicitly describe the disagreement as conflicting evidence; do not claim that anyone is lying or that a trap is confirmed. Do not reverse direction based on this divergence alone. Seek confirmation from candle closes, volume, and validated open-interest context; if evidence remains contradictory with no clear edge, use confidence 4/10 or lower and state that the forecast is not actionable.
@@ -45,6 +46,8 @@ ADVISORY_FIELDS = {
     "market_regime",
     "reasoning",
 }
+GEMINI_MAX_RETRIES = 3
+GEMINI_RETRY_BACKOFF_SECONDS = 5
 ADVISORY_DIRECTIONS = {"UP", "DOWN"}
 
 
@@ -157,6 +160,11 @@ def _apply_python_strategy_checks(
         limitations.append(
             "Strong-dollar headwind (DXY daily change at or above +0.40%) caps UP confidence at 5/10."
         )
+    elif math.isfinite(dxy_change) and dxy_change <= -0.40 and direction == "DOWN":
+        confidence = min(confidence, 5)
+        limitations.append(
+            "Aggressively falling DXY (daily change at or below -0.40%) risks a short squeeze and caps DOWN confidence at 5/10."
+        )
     elif not math.isfinite(dxy_change):
         limitations.append(
             "DXY daily change is unavailable, so the macro filter could not be evaluated."
@@ -174,6 +182,15 @@ def _apply_python_strategy_checks(
         confidence = max(1, confidence - 2)
         limitations.append(
             "Crowded-long warning: annualized funding exceeds 25%; UP confidence reduced by at least two points."
+        )
+    elif (
+        math.isfinite(annualized_funding)
+        and annualized_funding < -15
+        and direction == "DOWN"
+    ):
+        confidence = max(1, confidence - 2)
+        limitations.append(
+            "Crowded-short warning: annualized funding is below -15%; DOWN confidence reduced by at least two points to limit squeeze risk."
         )
     elif not math.isfinite(annualized_funding):
         limitations.append(
@@ -327,7 +344,7 @@ def generate_trading_advisory(
     client = genai.Client()
 
     with Image.open(image_path) as chart_image:
-        for attempt in range(4):
+        for attempt in range(GEMINI_MAX_RETRIES + 1):
             try:
                 response = client.models.generate_content(
                     model="gemini-3.8-flash",
@@ -346,15 +363,20 @@ def generate_trading_advisory(
                 )
                 break
             except Exception as exc:
-                error_response = getattr(exc, "response", None)
-                status_code = (
-                    getattr(exc, "code", None)
-                    or getattr(exc, "status_code", None)
-                    or getattr(error_response, "status_code", None)
+                error_text = str(exc).upper()
+                retryable = any(
+                    marker in error_text for marker in ("503", "429", "UNAVAILABLE")
                 )
-                if str(status_code) != "503" or attempt == 3:
-                    raise
-                time.sleep(5)
+                if not retryable or attempt == GEMINI_MAX_RETRIES:
+                    raise RuntimeError(
+                        f"Gemini 4-hour forecast request failed: {exc}"
+                    ) from exc
+                delay = GEMINI_RETRY_BACKOFF_SECONDS * (2 ** attempt)
+                print(
+                    f"[API] Gemini servers busy. Retrying attempt "
+                    f"{attempt + 1}/{GEMINI_MAX_RETRIES} in {delay} seconds..."
+                )
+                time.sleep(delay)
 
     try:
         advisory = validate_advisory(json.loads(response.text))

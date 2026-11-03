@@ -56,11 +56,16 @@
           <p class="mono mb-1 text-[11px] uppercase tracking-[.2em] text-slate-500">Decision support · probabilistic outlook</p>
           <h2 class="text-2xl font-semibold text-white sm:text-3xl">Market overview</h2>
         </div>
-        <button id="analyzeButton" type="button" class="inline-flex min-h-11 items-center justify-center gap-2 rounded-xl bg-emerald-400 px-5 py-3 font-semibold text-slate-950 shadow-lg shadow-emerald-950/30 transition hover:bg-emerald-300 disabled:cursor-not-allowed disabled:opacity-60">
-          <span id="buttonSpinner" class="spinner hidden h-4 w-4 rounded-full"></span>
-          <svg id="buttonIcon" viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 12a8 8 0 1 0 2.34-5.66"/><path d="M4 4v5h5"/></svg>
-          <span id="buttonLabel">Run Analysis</span>
-        </button>
+        <div class="flex flex-wrap gap-3">
+          <button id="btn-4h" type="button" class="inline-flex min-h-11 items-center justify-center gap-2 rounded-xl bg-sky-500 px-5 py-3 font-semibold text-white shadow-lg shadow-sky-950/30 transition hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-60">
+            <span id="spinner-4h" class="spinner hidden h-4 w-4 rounded-full"></span>
+            <span id="label-4h">Run 4-Hour AI Strategy</span>
+          </button>
+          <button id="btn-2h" type="button" class="inline-flex min-h-11 items-center justify-center gap-2 rounded-xl bg-purple-600 px-5 py-3 font-semibold text-white shadow-lg shadow-purple-950/30 transition hover:bg-purple-500 disabled:cursor-not-allowed disabled:opacity-60">
+            <span id="spinner-2h" class="spinner hidden h-4 w-4 rounded-full"></span>
+            <span id="label-2h">Run 2-Hour AI Forecast</span>
+          </button>
+        </div>
       </section>
 
       <div id="errorBanner" class="hidden rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200" role="alert"></div>
@@ -70,7 +75,7 @@
           <div class="mb-6 flex items-start justify-between gap-4">
             <div>
               <p class="mono text-[10px] uppercase tracking-[.2em] text-slate-500">AI synthesis</p>
-              <h3 class="mt-1 text-lg font-semibold text-white">Trading advisory</h3>
+              <h3 id="advisoryTitle" class="mt-1 text-lg font-semibold text-white">Trading advisory</h3>
             </div>
             <span id="directionTag" class="rounded-lg border border-slate-600 bg-slate-800/80 px-3 py-1.5 mono text-xs font-bold tracking-wider text-slate-400">AWAITING DATA</span>
           </div>
@@ -130,6 +135,36 @@
         </article>
       </section>
 
+      <div id="dashboard-results" style="display: none; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 20px; margin-top: 30px;">
+        <div style="background: #1e1e24; border: 1px solid #333; padding: 20px; border-radius: 8px; color: #fff;">
+          <h3 id="ai-panel-title" style="margin-top: 0; color: #2196f3; border-bottom: 1px solid #333; padding-bottom: 10px;">🤖 AI 4H Forecast</h3>
+          <p><strong>Direction:</strong> <span id="ai-direction" style="font-weight: bold; font-size: 1.1em;">-</span></p>
+          <p><strong>Target Range:</strong> $<span id="ai-low">-</span> to $<span id="ai-high">-</span></p>
+          <p><strong>Confidence:</strong> <span id="ai-confidence">-</span> / 10</p>
+          <p style="color: #aaa; font-size: 0.9em; line-height: 1.4;">
+            <strong>Regime:</strong> <span id="ai-regime">-</span><br><br>
+            <strong>Reasoning:</strong> <span id="ai-reason">-</span>
+          </p>
+        </div>
+
+        <div style="background: #1e1e24; border: 1px solid #333; padding: 20px; border-radius: 8px; color: #fff;">
+          <h3 style="margin-top: 0; color: #4caf50; border-bottom: 1px solid #333; padding-bottom: 10px;">📈 Polymarket Paper Trade</h3>
+          <p><strong>Status:</strong> <span id="pm-status" style="font-weight: bold; font-size: 1.1em;">-</span></p>
+          <p><strong>Market ID:</strong> <span id="pm-market" style="font-family: monospace; font-size: 0.9em; color: #bbb;">-</span></p>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; background: #2a2a35; padding: 10px; border-radius: 6px; margin: 15px 0;">
+            <div>
+              <span style="color: #888; font-size: 0.8em;">ENTRY PRICE</span><br>
+              $<span id="pm-price" style="font-size: 1.2em; font-weight: bold;">-</span>
+            </div>
+            <div>
+              <span style="color: #888; font-size: 0.8em;">SHARES</span><br>
+              <span id="pm-shares" style="font-size: 1.2em; font-weight: bold;">-</span>
+            </div>
+          </div>
+          <p style="color: #aaa; font-size: 0.9em;"><strong>Details:</strong> <span id="pm-reason">-</span></p>
+        </div>
+      </div>
+
       <section class="glass overflow-hidden rounded-2xl border border-slate-700/60 shadow-xl shadow-black/20">
         <div class="flex flex-col gap-3 border-b border-slate-700/60 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
@@ -165,7 +200,7 @@
 
   <script>
     const byId = (id) => document.getElementById(id);
-    const analyzeButton = byId("analyzeButton");
+    const forecastButtons = [byId("btn-4h"), byId("btn-2h")];
 
     function showError(message) {
       const banner = byId("errorBanner");
@@ -184,38 +219,77 @@
       return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(number);
     }
 
-    function setLoading(loading) {
-      analyzeButton.disabled = loading;
-      byId("buttonSpinner").classList.toggle("hidden", !loading);
-      byId("buttonIcon").classList.toggle("hidden", loading);
-      byId("buttonLabel").textContent = loading ? "Analyzing…" : "Run Analysis";
+    function setLoading(loading, typeLabel = "") {
+      for (const button of forecastButtons) button.disabled = loading;
+      byId("spinner-4h").classList.toggle("hidden", !loading || typeLabel !== "4H");
+      byId("spinner-2h").classList.toggle("hidden", !loading || typeLabel !== "2H");
       if (loading) {
         byId("chartStatus").textContent = "GENERATING";
-        byId("reasoning").textContent = "Fetching market data and generating the advisory…";
+        byId("reasoning").textContent = `Fetching market data and generating the ${typeLabel} forecast…`;
       }
     }
 
-    function renderAdvisory(data) {
-      const direction = String(data.direction || "UNKNOWN").toUpperCase();
+    function renderForecast(data, typeLabel) {
+      const direction = String(data.predicted_direction || data.direction || "UNKNOWN").toUpperCase();
+      const isTwoHour = typeLabel === "2H";
+      const directionStyle = direction === "UP" || direction === "BULLISH"
+        ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300"
+        : direction === "DOWN" || direction === "BEARISH"
+          ? "border-rose-400/30 bg-rose-400/10 text-rose-300"
+          : "border-amber-400/30 bg-amber-400/10 text-amber-300";
       const tag = byId("directionTag");
       tag.textContent = direction;
       tag.className = "rounded-lg border px-3 py-1.5 mono text-xs font-bold tracking-wider";
-      const directionStyles = {
-        UP: "border-emerald-400/30 bg-emerald-400/10 text-emerald-300",
-        DOWN: "border-rose-400/30 bg-rose-400/10 text-rose-300",
-        WAIT: "border-amber-400/30 bg-amber-400/10 text-amber-300",
-        NEUTRAL: "border-amber-400/30 bg-amber-400/10 text-amber-300"
-      };
-      tag.classList.add(...(directionStyles[direction] || "border-slate-600 bg-slate-800 text-slate-300").split(" "));
+      tag.classList.add(...directionStyle.split(" "));
 
       const confidence = Math.max(0, Math.min(10, Number(data.confidence_score) || 0));
       byId("confidenceText").textContent = `${confidence} / 10`;
       byId("confidenceBar").style.width = `${confidence * 10}%`;
       byId("confidenceBar").className = `h-full rounded-full transition-all duration-700 ${confidence >= 7 ? "bg-emerald-400" : confidence >= 4 ? "bg-amber-400" : "bg-rose-400"}`;
-      byId("targetRange").textContent = `${formatPrice(data.target_range_low)} — ${formatPrice(data.target_range_high)}`;
-      byId("invalidationPrice").textContent = formatPrice(data.invalidation_price);
-      byId("marketRegime").textContent = data.market_regime || "Unspecified";
-      byId("reasoning").textContent = data.reasoning || "No reasoning was returned.";
+      const low = data.target_range_low ?? data.expected_low ?? data.expected_low_next_2h;
+      const high = data.target_range_high ?? data.expected_high ?? data.expected_high_next_2h;
+      const reasoning = data.reasoning || data.predicted_scenario || "No reasoning was returned.";
+      byId("advisoryTitle").textContent = isTwoHour ? "2-Hour forecast" : "Trading advisory";
+      byId("targetRange").textContent = `${formatPrice(low)} — ${formatPrice(high)}`;
+      byId("invalidationPrice").textContent = isTwoHour ? "Not provided" : formatPrice(data.invalidation_price);
+      byId("marketRegime").textContent = data.market_regime || (isTwoHour ? "2-hour forecast" : "Unspecified");
+      byId("reasoning").textContent = reasoning;
+
+      const dashboardResults = byId("dashboard-results");
+      dashboardResults.style.display = "grid";
+
+      byId("ai-panel-title").textContent = `🤖 AI ${typeLabel} Forecast`;
+      byId("ai-direction").textContent = direction;
+      byId("ai-direction").style.color = direction === "UP" || direction === "BULLISH"
+        ? "#4caf50"
+        : direction === "DOWN" || direction === "BEARISH" ? "#f44336" : "#ffb74d";
+      byId("ai-low").textContent = low == null ? "-" : Number(low).toFixed(2);
+      byId("ai-high").textContent = high == null ? "-" : Number(high).toFixed(2);
+      byId("ai-confidence").textContent = data.confidence_score == null ? "-" : String(confidence);
+      byId("ai-regime").textContent = data.market_regime || (isTwoHour ? "2-hour forecast" : "Unspecified");
+      byId("ai-reason").textContent = reasoning;
+
+      const paper = data.polymarket_paper || { status: "skipped", reason: "No paper trade was attempted." };
+      const pmStatusEl = byId("pm-status");
+      const pmMarketEl = byId("pm-market");
+      const pmPriceEl = byId("pm-price");
+      const pmSharesEl = byId("pm-shares");
+      const pmReasonEl = byId("pm-reason");
+      const status = String(paper.status || "skipped").toUpperCase();
+      pmStatusEl.textContent = status;
+      pmStatusEl.style.color = status === "ENTERED" ? "#4caf50" : status === "SKIPPED" || status === "IGNORED" ? "#ffb74d" : "#f87171";
+
+      if (paper.status === "entered" && paper.trade) {
+        pmMarketEl.textContent = paper.trade.market_id || "-";
+        pmPriceEl.textContent = Number(paper.trade.entry_odds || 0).toFixed(4);
+        pmSharesEl.textContent = Number(paper.trade.shares || 0).toFixed(4);
+        pmReasonEl.textContent = `Outcome: ${paper.trade.outcome_bought || "unknown"}; stake $${Number(paper.trade.stake || 0).toFixed(2)}.`;
+      } else {
+        pmMarketEl.textContent = "-";
+        pmPriceEl.textContent = "-";
+        pmSharesEl.textContent = "-";
+        pmReasonEl.textContent = paper.reason || "No paper trade was attempted.";
+      }
     }
 
     async function loadChart() {
@@ -296,25 +370,35 @@
       }
     }
 
-    async function runAnalysis() {
+    async function runForecast(endpoint, typeLabel) {
       clearError();
-      setLoading(true);
+      setLoading(true, typeLabel);
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 180000);
       try {
-        const response = await fetch("/api/analyze", { headers: { "Accept": "application/json" } });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.detail || data.error || "Analysis request failed.");
-        renderAdvisory(data);
+        const forecastResponse = await fetch(endpoint, {
+          headers: { "Accept": "application/json" },
+          signal: controller.signal
+        });
+        const data = await forecastResponse.json();
+        if (!forecastResponse.ok) throw new Error(data.detail || data.error || `${typeLabel} forecast request failed.`);
+        renderForecast(data, typeLabel);
         await loadChart();
         await loadHistory();
       } catch (error) {
-        showError(`Analysis failed: ${error.message}`);
+        const message = error.name === "AbortError"
+          ? `${typeLabel} forecast timed out. Check the server logs and try again.`
+          : error.message;
+        showError(`${typeLabel} forecast failed: ${message}`);
         byId("chartStatus").textContent = "ANALYSIS ERROR";
       } finally {
+        window.clearTimeout(timeoutId);
         setLoading(false);
       }
     }
 
-    analyzeButton.addEventListener("click", runAnalysis);
+    byId("btn-4h").addEventListener("click", () => runForecast("/api/analyze", "4H"));
+    byId("btn-2h").addEventListener("click", () => runForecast("/api/predict_2h", "2H"));
     byId("refreshHistory").addEventListener("click", loadHistory);
     loadHistory();
     loadChart();

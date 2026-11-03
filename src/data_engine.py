@@ -10,6 +10,9 @@ import yfinance as yf
 
 BINANCE_FUTURES_BASE_URL = "https://fapi.binance.com"
 REQUEST_TIMEOUT_SECONDS = 10
+ORDER_BOOK_SEARCH_RADIUS_USD = 2_000.0
+ORDER_BOOK_PRICE_BIN_USD = 10.0
+INSTITUTIONAL_WALL_THRESHOLD_USD = 1_000_000.0
 
 
 def _confirmed_candles(df: pd.DataFrame, interval: str) -> pd.DataFrame:
@@ -271,14 +274,14 @@ def fetch_order_book_walls(symbol: str = "BTCUSDT") -> dict[str, Any]:
     if not isinstance(order_book, dict):
         raise RuntimeError(f"Binance returned an invalid {symbol} order book.")
 
-    def largest_wall(side_name: str, side_label: str) -> dict[str, float]:
+    parsed_levels: dict[str, list[tuple[float, float]]] = {}
+    for side_name, side_label in (("bids", "bid"), ("asks", "ask")):
         levels = order_book.get(side_name)
         if not isinstance(levels, list) or not levels:
             raise RuntimeError(
                 f"Binance returned no {side_label} levels for {symbol}."
             )
-
-        largest: tuple[float, float] | None = None
+        parsed_levels[side_name] = []
         for level in levels:
             if not isinstance(level, (list, tuple)) or len(level) < 2:
                 raise RuntimeError(
@@ -299,29 +302,86 @@ def fetch_order_book_walls(symbol: str = "BTCUSDT") -> dict[str, Any]:
                 raise RuntimeError(
                     f"Binance returned an invalid {side_label} level for {symbol}."
                 )
-            if largest is None or quantity > largest[1]:
-                largest = (price, quantity)
-
-        if largest is None or largest[1] <= 0:
+            if quantity > 0:
+                parsed_levels[side_name].append((price, quantity))
+        if not parsed_levels[side_name]:
             raise RuntimeError(
                 f"Binance returned no positive-quantity {side_label} level for {symbol}."
             )
-        price, quantity = largest
+
+    midpoint = (
+        max(price for price, _ in parsed_levels["bids"])
+        + min(price for price, _ in parsed_levels["asks"])
+    ) / 2
+
+    def largest_wall(side_name: str) -> dict[str, Any]:
+        bins: dict[float, dict[str, float]] = {}
+        for price, quantity in parsed_levels[side_name]:
+            if abs(price - midpoint) > ORDER_BOOK_SEARCH_RADIUS_USD:
+                continue
+            bin_price = (
+                math.floor(price / ORDER_BOOK_PRICE_BIN_USD)
+                * ORDER_BOOK_PRICE_BIN_USD
+            )
+            bucket = bins.setdefault(
+                bin_price,
+                {"quantity_btc": 0.0, "notional_usd": 0.0},
+            )
+            bucket["quantity_btc"] += quantity
+            bucket["notional_usd"] += price * quantity
+
+        if not bins:
+            raise RuntimeError(
+                f"Binance returned no {side_name[:-1]} levels within "
+                f"${ORDER_BOOK_SEARCH_RADIUS_USD:,.0f} of the midpoint for {symbol}."
+            )
+        bin_price, bucket = max(
+            bins.items(),
+            key=lambda item: item[1]["notional_usd"],
+        )
+        notional = bucket["notional_usd"]
         return {
-            "price_usd": price,
-            "quantity_btc": quantity,
-            "notional_usd": price * quantity,
+            "price_usd": notional / bucket["quantity_btc"],
+            "price_bin_start_usd": bin_price,
+            "quantity_btc": bucket["quantity_btc"],
+            "notional_usd": notional,
+            "meets_institutional_threshold": (
+                notional >= INSTITUTIONAL_WALL_THRESHOLD_USD
+            ),
+            "distance_from_midpoint_usd": abs(
+                (notional / bucket["quantity_btc"]) - midpoint
+            ),
         }
+
+    all_prices = [
+        price
+        for side in parsed_levels.values()
+        for price, _ in side
+        if abs(price - midpoint) <= ORDER_BOOK_SEARCH_RADIUS_USD
+    ]
 
     return {
         "symbol": symbol,
         "depth_limit": 1000,
+        "search_radius_usd": ORDER_BOOK_SEARCH_RADIUS_USD,
+        "price_bin_width_usd": ORDER_BOOK_PRICE_BIN_USD,
+        "institutional_wall_threshold_usd": INSTITUTIONAL_WALL_THRESHOLD_USD,
+        "observed_price_range_usd": (
+            max(all_prices) - min(all_prices) if all_prices else 0.0
+        ),
+        "observed_distance_from_midpoint_usd": (
+            max(abs(price - midpoint) for price in all_prices)
+            if all_prices
+            else 0.0
+        ),
         "snapshot_timestamp_utc": pd.Timestamp.now(tz="UTC").isoformat(),
-        "largest_buy_wall": largest_wall("bids", "bid"),
-        "largest_sell_wall": largest_wall("asks", "ask"),
+        "largest_buy_wall": largest_wall("bids"),
+        "largest_sell_wall": largest_wall("asks"),
         "interpretation_note": (
-            "A single snapshot shows displayed resting liquidity only; it cannot "
-            "establish persistence or identify spoofing."
+            "Walls aggregate displayed quantities into $10 price bins and are "
+            "limited to Binance's 1,000-level snapshot. The $2,000 search radius "
+            "cannot extend beyond the prices actually returned. A single snapshot "
+            "cannot establish persistence or identify spoofing."
         ),
     }
 
@@ -670,6 +730,12 @@ def _build_institutional_order_flow(
             if isinstance(sell_notional, (int, float))
             and math.isfinite(sell_notional)
             else "Unavailable"
+        ),
+        "largest_buy_wall_meets_institutional_threshold": bool(
+            buy_wall.get("meets_institutional_threshold", False)
+        ),
+        "largest_sell_wall_meets_institutional_threshold": bool(
+            sell_wall.get("meets_institutional_threshold", False)
         ),
         "cvd_status": cvd_statuses.get(taker_status, "Unavailable"),
         "open_interest_trend": open_interest_statuses.get(

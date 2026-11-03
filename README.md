@@ -5,6 +5,8 @@
 - `src/` — Python application and forecasting modules
 - `assets/` — generated charts and archived chart images
 - `logs/` — prediction, trade, and runtime logs; `logs/backups/` contains archived CSVs
+- `vault/01_Playbooks/` — human-readable playbooks
+- `vault/02_Trade_Memories/` — Markdown forecast outcomes used as the secondary brain
 - `templates/` — dashboard HTML
 - `tests/` — automated tests
 
@@ -30,16 +32,22 @@ internally for risk checks and prediction logging.
   are marked `NEEDS_REVIEW`, not assigned a guessed result. Malformed or
   market-shaped rows in an old shared advisory file are left in the original and
   its backup, rather than misclassified as dashboard predictions.
-- Pending BTC forecasts are evaluated after their intended two-hour expiry. The
-  evaluator records direction correctness, final-close range coverage, full-period
-  range coverage, and projected-price errors as separate measurements. For
-  `SIDEWAYS`, direction correctness is not applicable; the two range measurements
-  are used instead.
+- Pending BTC forecasts and four-hour advisories are evaluated after their expiry.
+  Evaluation outcomes and full forecast context are saved to dated Markdown files
+  under `vault/02_Trade_Memories/`, which are read to provide past lessons to the
+  four-hour engine. The two-hour evaluator records direction correctness,
+  final-close range coverage, full-period range coverage, and projected-price
+  errors as separate measurements. For `SIDEWAYS`, range coverage determines the
+  outcome.
 - Evaluation prefers a 15-minute close at the exact expiry boundary. When expiry
   falls between 15-minute closes, it uses the latest completed 1-minute close no
   more than one minute before expiry. Range measurements use complete OHLC candle
   bars overlapping the evaluated interval, and the actual close timestamp is
   recorded so the candle resolution is visible.
+- Order-book walls are aggregated in $10 price bins from Binance's 1,000-level
+  depth snapshot. The evaluator reports the observed snapshot span because the
+  endpoint may return fewer levels than needed to cover the full $2,000 search
+  radius.
 
 ## Run
 
@@ -55,4 +63,28 @@ python -m venv venv
 .\venv\Scripts\python.exe -m src.market_predictor
 .\venv\Scripts\python.exe -m src.trading_agent
 .\venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+### Polymarket paper trading
+
+The scheduler also runs an isolated Polymarket paper engine. It makes public
+read-only Gamma and CLOB requests; it does not connect a wallet or submit orders.
+The engine only enters a BTC Up/Down market when the market's published opening,
+closing, duration, and resolution rules match a newly issued forecast. It logs
+and skips unavailable, mismatched, stale, or illiquid markets. Positions are
+settled only after Gamma reports a confirmed final outcome.
+
+By default the separate virtual account starts with a `$100` bankroll and uses
+a fixed `$5` stake per entry. Set `POLYMARKET_PAPER_BANKROLL` and
+`POLYMARKET_PAPER_STAKE` before the first run to configure those defaults.
+Entry costs include the ask-side spread, available ask liquidity, and the
+market's taker fee using Polymarket's published crypto fee curve where enabled.
+Paper state, entries/skips, and confirmed settlement results are stored in
+`logs/polymarket_paper_state.json`,
+`logs/polymarket_paper_trades.csv`, and
+`logs/polymarket_paper_results.csv`. To run the integrated forecast and paper
+trading scheduler:
+
+```powershell
+.\venv\Scripts\python.exe -m src.auto_run
 ```
