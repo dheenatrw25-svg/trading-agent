@@ -8,7 +8,7 @@ from src import market_predictor
 
 
 class MarketPredictorHttpTests(unittest.TestCase):
-    def test_gemini_request_uses_120_second_timeout_and_sdk_retries_disabled(self):
+    def test_gemini_request_uses_the_shared_client_factory(self):
         prediction = {
             "predicted_direction": "BULLISH",
             "confidence_score": 7,
@@ -23,7 +23,11 @@ class MarketPredictorHttpTests(unittest.TestCase):
         )
 
         with (
-            patch.object(market_predictor.genai, "Client", return_value=client) as factory,
+            patch.object(
+                market_predictor.gemini_utils,
+                "create_client",
+                return_value=client,
+            ) as factory,
             patch.object(Image, "open", return_value=object()),
         ):
             result = market_predictor.predict_next_2_hours(
@@ -32,13 +36,7 @@ class MarketPredictorHttpTests(unittest.TestCase):
                 "BTC-USD",
             )
 
-        http_options = factory.call_args.kwargs["http_options"]
-        self.assertEqual(
-            http_options.timeout,
-            120_000,
-        )
-        self.assertLessEqual(http_options.timeout, 120_000)
-        self.assertEqual(http_options.retry_options.attempts, 1)
+        factory.assert_called_once_with()
         self.assertEqual(result["predicted_direction"], "BULLISH")
 
     def test_gemini_busy_response_retries_with_exponential_backoff(self):
@@ -57,9 +55,9 @@ class MarketPredictorHttpTests(unittest.TestCase):
         ]
 
         with (
-            patch.object(market_predictor.genai, "Client", return_value=client),
+            patch.object(market_predictor.gemini_utils, "create_client", return_value=client),
             patch.object(Image, "open", return_value=object()),
-            patch.object(market_predictor.time, "sleep") as sleep,
+            patch.object(market_predictor.gemini_utils.time, "sleep") as sleep,
             patch("builtins.print") as print_call,
         ):
             result = market_predictor.predict_next_2_hours(
@@ -74,7 +72,9 @@ class MarketPredictorHttpTests(unittest.TestCase):
         self.assertEqual(
             [call.args[0] for call in print_call.call_args_list],
             [
-                "[API] Gemini 2H attempt 1/3 failed (RuntimeError); retrying in 5 seconds."
+                "[API] Gemini request attempt 1/3 failed: "
+                "type=RuntimeError, message=504 DEADLINE_EXCEEDED; "
+                "retrying in 5 seconds."
             ],
         )
 
@@ -87,12 +87,13 @@ class MarketPredictorHttpTests(unittest.TestCase):
         ]
 
         with (
-            patch.object(market_predictor.genai, "Client", return_value=client),
+            patch.object(market_predictor.gemini_utils, "create_client", return_value=client),
             patch.object(Image, "open", return_value=object()),
-            patch.object(market_predictor.time, "sleep") as sleep,
+            patch.object(market_predictor.gemini_utils.time, "sleep") as sleep,
             self.assertRaisesRegex(
                 RuntimeError,
-                "Gemini 2-hour forecast request failed after 3 attempt\\(s\\) \\(RuntimeError\\)",
+                "Gemini API request failed: type=RuntimeError, .*"
+                "message=HTTP 504 deadline exceeded",
             ),
         ):
             market_predictor.predict_next_2_hours(
@@ -107,33 +108,57 @@ class MarketPredictorHttpTests(unittest.TestCase):
             [5, 10],
         )
 
+    def test_invalid_json_and_empty_gemini_response_are_rejected(self):
+        for response, error in (
+            (Mock(text="{invalid"), "not a valid JSON forecast"),
+            (Mock(text=""), "response was empty"),
+        ):
+            with self.subTest(error=error):
+                client = Mock()
+                client.models.generate_content.return_value = response
+                with (
+                    patch.object(
+                        market_predictor.gemini_utils,
+                        "create_client",
+                        return_value=client,
+                    ),
+                    patch.object(Image, "open", return_value=object()),
+                    self.assertRaisesRegex(ValueError, error),
+                ):
+                    market_predictor.predict_next_2_hours(
+                        "forecast.png",
+                        {"current_price": 100.0},
+                        "BTC-USD",
+                    )
+
     def test_http_statuses_and_connection_timeouts_are_retryable(self):
         for status_code in (429, 502, 503, 504):
             error = RuntimeError("transient API error")
             error.code = status_code
             with self.subTest(status_code=status_code):
-                self.assertTrue(market_predictor._is_retryable_gemini_error(error))
+                self.assertTrue(market_predictor.gemini_utils._is_retryable(error))
 
         self.assertTrue(
-            market_predictor._is_retryable_gemini_error(
+            market_predictor.gemini_utils._is_retryable(
                 TimeoutError("connection timed out")
             )
         )
 
-    def test_permanent_gemini_error_is_not_retried_or_logged_with_error_text(self):
+    def test_permanent_gemini_error_is_not_retried_and_is_diagnosed(self):
         client = Mock()
         client.models.generate_content.side_effect = RuntimeError(
             "invalid API key: sensitive-value"
         )
 
         with (
-            patch.object(market_predictor.genai, "Client", return_value=client),
+            patch.object(market_predictor.gemini_utils, "create_client", return_value=client),
             patch.object(Image, "open", return_value=object()),
-            patch.object(market_predictor.time, "sleep") as sleep,
+            patch.object(market_predictor.gemini_utils.time, "sleep") as sleep,
             patch("builtins.print") as print_call,
             self.assertRaisesRegex(
                 RuntimeError,
-                "Gemini 2-hour forecast request failed after 1 attempt",
+                "Gemini API request failed: type=RuntimeError, .*"
+                "message=invalid API key: sensitive-value",
             ),
         ):
             market_predictor.predict_next_2_hours(
@@ -145,7 +170,8 @@ class MarketPredictorHttpTests(unittest.TestCase):
         client.models.generate_content.assert_called_once()
         sleep.assert_not_called()
         print_call.assert_called_once_with(
-            "[API] Gemini 2H attempt 1/3 failed (RuntimeError); no retry will be made."
+            "[API] Gemini request failed on attempt 1/3: "
+            "type=RuntimeError, message=invalid API key: sensitive-value"
         )
 
     def test_market_data_download_has_an_explicit_timeout(self):
@@ -173,12 +199,13 @@ class MarketPredictorHttpTests(unittest.TestCase):
         ]
 
         with (
-            patch.object(market_predictor.genai, "Client", return_value=client),
+            patch.object(market_predictor.gemini_utils, "create_client", return_value=client),
             patch.object(Image, "open", return_value=object()),
-            patch.object(market_predictor.time, "sleep") as sleep,
+            patch.object(market_predictor.gemini_utils.time, "sleep") as sleep,
             self.assertRaisesRegex(
                 RuntimeError,
-                "Gemini 2-hour forecast request failed after 3 attempt",
+                "Gemini API request failed: type=TimeoutError, .*"
+                "message=read timed out",
             ),
         ):
             market_predictor.predict_next_2_hours(

@@ -72,7 +72,7 @@ class PlaybookTests(unittest.TestCase):
                 patch.object(
                     pro_strategist, "retrieve_past_lessons", return_value="LESSON TEXT"
                 ),
-                patch.object(pro_strategist.genai, "Client", return_value=client),
+                patch.object(pro_strategist.gemini_utils, "create_client", return_value=client),
             ):
                 result = pro_strategist.generate_trading_advisory(
                     market_context, str(image_path)
@@ -95,7 +95,11 @@ class PlaybookTests(unittest.TestCase):
         )
         self.assertIn("LESSON TEXT", contents[4])
         self.assertIsInstance(contents[5], Image.Image)
-        self.assertEqual(request["model"], "gemini-3.8-flash")
+        self.assertEqual(request["model"], "gemini-3.0-flash")
+        self.assertNotIn(
+            "temperature",
+            request["config"].model_dump(exclude_none=True),
+        )
 
     def test_busy_gemini_response_retries_with_exponential_backoff(self) -> None:
         client = Mock()
@@ -119,8 +123,8 @@ class PlaybookTests(unittest.TestCase):
                 patch.object(
                     pro_strategist, "retrieve_past_lessons", return_value="LESSONS"
                 ),
-                patch.object(pro_strategist.genai, "Client", return_value=client),
-                patch.object(pro_strategist.time, "sleep") as sleep,
+                patch.object(pro_strategist.gemini_utils, "create_client", return_value=client),
+                patch.object(pro_strategist.gemini_utils.time, "sleep") as sleep,
                 patch("builtins.print") as print_call,
             ):
                 result = pro_strategist.generate_trading_advisory(
@@ -133,8 +137,12 @@ class PlaybookTests(unittest.TestCase):
         self.assertEqual(
             [call.args[0] for call in print_call.call_args_list],
             [
-                "[API] Gemini servers busy. Retrying attempt 1/3 in 5 seconds...",
-                "[API] Gemini servers busy. Retrying attempt 2/3 in 10 seconds...",
+                "[API] Gemini request attempt 1/3 failed: "
+                "type=RuntimeError, message=503 UNAVAILABLE: high demand; "
+                "retrying in 5 seconds.",
+                "[API] Gemini request attempt 2/3 failed: "
+                "type=RuntimeError, message=429 rate limited; "
+                "retrying in 10 seconds.",
             ],
         )
 
@@ -156,11 +164,11 @@ class PlaybookTests(unittest.TestCase):
                 patch.object(
                     pro_strategist, "retrieve_past_lessons", return_value="LESSONS"
                 ),
-                patch.object(pro_strategist.genai, "Client", return_value=client),
-                patch.object(pro_strategist.time, "sleep") as sleep,
+                patch.object(pro_strategist.gemini_utils, "create_client", return_value=client),
+                patch.object(pro_strategist.gemini_utils.time, "sleep") as sleep,
                 self.assertRaisesRegex(
                     RuntimeError,
-                    "Gemini 4-hour forecast request failed: invalid API key",
+                    "Gemini API request failed: type=RuntimeError, message=invalid API key",
                 ),
             ):
                 pro_strategist.generate_trading_advisory(
@@ -169,6 +177,38 @@ class PlaybookTests(unittest.TestCase):
 
         client.models.generate_content.assert_called_once()
         sleep.assert_not_called()
+
+    def test_empty_and_invalid_json_advisories_fail_before_parsing(self) -> None:
+        market_context = {
+            "spot": {"current_close": 100.0},
+            "current_price": 100.0,
+            "technical_indicators": {},
+            "institutional_order_flow": {},
+        }
+        for response, error in (
+            (Mock(text=""), "response was empty"),
+            (Mock(text="{invalid"), "Gemini response was not valid JSON"),
+        ):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
+                client = Mock()
+                client.models.generate_content.return_value = response
+                image_path = Path(directory) / "chart.png"
+                Image.new("RGB", (4, 4)).save(image_path)
+                with (
+                    patch.object(pro_strategist, "load_playbook", return_value="PLAYBOOK"),
+                    patch.object(
+                        pro_strategist, "retrieve_past_lessons", return_value="LESSONS"
+                    ),
+                    patch.object(
+                        pro_strategist.gemini_utils,
+                        "create_client",
+                        return_value=client,
+                    ),
+                    self.assertRaisesRegex(ValueError, error),
+                ):
+                    pro_strategist.generate_trading_advisory(
+                        market_context, str(image_path)
+                    )
 
     def test_system_prompt_explains_wall_and_taker_divergence_rules(self) -> None:
         self.assertIn("Do not set a target beyond a nearby opposing wall", pro_strategist.PRO_TRADER_PROMPT)

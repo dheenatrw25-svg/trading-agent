@@ -2,7 +2,6 @@ import json
 import datetime
 import math
 import tempfile
-import time
 import uuid
 from pathlib import Path
 
@@ -11,10 +10,9 @@ import pandas as pd
 import yfinance as yf
 import mplfinance as mpf
 from PIL import Image
-from google import genai
 from google.genai import types
-from dotenv import load_dotenv
-from .paths import ASSETS_DIR, PROJECT_ROOT
+from . import gemini_utils
+from .paths import ASSETS_DIR
 from .prediction_logs import (
     BTC_FORECAST_FIELDS,
     BTC_FORECAST_FILE,
@@ -25,15 +23,9 @@ from .prediction_logs import (
     utc_now,
 )
 
-load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
-
 LOG_FILE = BTC_FORECAST_FILE
 FORECAST_HORIZON_HOURS = 2
 MARKET_DATA_TIMEOUT_SECONDS = 15
-GEMINI_REQUEST_TIMEOUT_MS = 120_000
-GEMINI_MAX_ATTEMPTS = 3
-GEMINI_RETRY_BACKOFF_SECONDS = 5
-GEMINI_RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
 MAX_EXPECTED_RANGE_WIDTH = 450.0
 MAX_DIRECTIONAL_ANCHOR_BUFFER = 50.0
 ALLOWED_DIRECTIONS = {"BULLISH", "BEARISH", "SIDEWAYS"}
@@ -45,53 +37,6 @@ REQUIRED_PREDICTION_FIELDS = {
     "projected_price_in_2h",
     "predicted_scenario",
 }
-
-
-def _is_retryable_gemini_error(exc: Exception) -> bool:
-    current: BaseException | None = exc
-    while current is not None:
-        for attribute in ("code", "status_code"):
-            status_code = getattr(current, attribute, None)
-            try:
-                if int(status_code) in GEMINI_RETRYABLE_STATUS_CODES:
-                    return True
-            except (TypeError, ValueError):
-                pass
-
-        response = getattr(current, "response", None)
-        try:
-            if int(getattr(response, "status_code", None)) in GEMINI_RETRYABLE_STATUS_CODES:
-                return True
-        except (TypeError, ValueError):
-            pass
-
-        error_text = str(current).upper()
-        if any(
-            marker in error_text
-            for marker in (
-                "429",
-                "502",
-                "503",
-                "504",
-                "UNAVAILABLE",
-                "DEADLINE_EXCEEDED",
-            )
-        ):
-            return True
-
-        exception_names = {
-            cls.__name__.casefold() for cls in type(current).__mro__
-        }
-        if isinstance(current, (TimeoutError, ConnectionError)) or any(
-            "timeout" in name
-            or "connecterror" in name
-            or "networkerror" in name
-            for name in exception_names
-        ):
-            return True
-
-        current = current.__cause__ or current.__context__
-    return False
 
 
 def clamp_prediction_range(
@@ -347,12 +292,7 @@ def calculate_metrics(df_micro: pd.DataFrame, df_macro: pd.DataFrame) -> dict:
 # 3. AI MARKET FORECASTER (The Brain)
 # ==========================================
 def predict_next_2_hours(image_path: str, metrics: dict, ticker: str) -> dict:
-    client = genai.Client(
-        http_options=types.HttpOptions(
-            timeout=GEMINI_REQUEST_TIMEOUT_MS,
-            retry_options=types.HttpRetryOptions(attempts=1),
-        )
-    )
+    client = gemini_utils.create_client()
     chart_image = Image.open(image_path)
 
     system_prompt = """
@@ -393,38 +333,19 @@ def predict_next_2_hours(image_path: str, metrics: dict, ticker: str) -> dict:
     Examine the dual chart image and metrics. Forecast the next 2 hours of price action.
     """
 
-    for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
-        try:
-            response = client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=[chart_image, user_prompt],
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    response_mime_type="application/json",
-                    temperature=0.2
-                )
-            )
-            break
-        except Exception as exc:
-            error_type = type(exc).__name__
-            if not _is_retryable_gemini_error(exc) or attempt == GEMINI_MAX_ATTEMPTS:
-                print(
-                    f"[API] Gemini 2H attempt {attempt}/{GEMINI_MAX_ATTEMPTS} "
-                    f"failed ({error_type}); no retry will be made."
-                )
-                raise RuntimeError(
-                    "Gemini 2-hour forecast request failed after "
-                    f"{attempt} attempt(s) ({error_type})."
-                ) from exc
-            delay = GEMINI_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
-            print(
-                f"[API] Gemini 2H attempt {attempt}/{GEMINI_MAX_ATTEMPTS} "
-                f"failed ({error_type}); retrying in {delay} seconds."
-            )
-            time.sleep(delay)
+    response = gemini_utils.generate_content_with_retry(
+        client,
+        model=gemini_utils.GEMINI_MODEL,
+        contents=[chart_image, user_prompt],
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            response_mime_type="application/json",
+        ),
+    )
+    text = gemini_utils.response_text(response, "2-hour forecast")
 
     try:
-        return validate_prediction(json.loads(response.text), metrics)
+        return validate_prediction(json.loads(text), metrics)
     except (json.JSONDecodeError, TypeError) as exc:
         raise ValueError("Gemini response was not a valid JSON forecast.") from exc
 

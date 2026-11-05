@@ -1,7 +1,9 @@
 import csv
 import datetime
 import hashlib
+import json
 import math
+import re
 import shutil
 import threading
 import uuid
@@ -9,7 +11,9 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .paths import LOGS_DIR
+import requests
+
+from .paths import LOGS_DIR, MEMORIES_DIR
 
 
 BTC_FORECAST_FILE = LOGS_DIR / "btc_forecasts_2h.csv"
@@ -114,6 +118,116 @@ BTC_FORECAST_FIELDS = [
     "legacy_source_file",
     "legacy_source_row",
 ]
+
+
+def get_binance_close_at_timestamp(symbol: str, target_ts_iso: str) -> float:
+    """Fetch the exact 1m candle close at a target timestamp from Binance."""
+    if not isinstance(symbol, str) or not symbol.strip():
+        raise ValueError("symbol must be a non-empty Binance ticker.")
+    if not isinstance(target_ts_iso, str) or not target_ts_iso.strip():
+        raise ValueError("target_ts_iso must be a non-empty ISO timestamp string.")
+
+    try:
+        dt = datetime.datetime.fromisoformat(target_ts_iso.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"Invalid target timestamp: {target_ts_iso!r}") from exc
+
+    ts_ms = int(dt.timestamp() * 1000)
+    url = (
+        "https://api.binance.com/api/v3/klines"
+        f"?symbol={symbol.upper()}&interval=1m&startTime={ts_ms}&limit=1"
+    )
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()
+    data = response.json()
+    if data:
+        return float(data[0][4])
+
+    live_response = requests.get(
+        f"https://api.binance.com/api/v3/ticker/price?symbol={symbol.upper()}",
+        timeout=10,
+    )
+    live_response.raise_for_status()
+    live_payload = live_response.json()
+    return float(live_payload["price"])
+
+
+def evaluate_pending_memories() -> list[Path]:
+    """
+    Scan memory files in vault/02_Trade_Memories and grade expired forecasts using
+    starting price vs. expiration close only. This ignores intra-window highs/lows.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    newly_lost_files: list[Path] = []
+
+    for md_file in sorted(MEMORIES_DIR.glob("*.md")):
+        content = md_file.read_text(encoding="utf-8")
+        if "WON:" in content or "LOST:" in content:
+            continue
+
+        match = re.search(r"```json\s*(\{.*?\})\s*```", content, flags=re.DOTALL)
+        if not match:
+            continue
+
+        try:
+            context_data = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+
+        target_ts_str = context_data.get("target_timestamp")
+        if not target_ts_str:
+            continue
+
+        try:
+            target_dt = datetime.datetime.fromisoformat(target_ts_str.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if now < target_dt.replace(tzinfo=datetime.timezone.utc):
+            continue
+
+        try:
+            start_price = float(context_data["btc_price_at_prediction"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        try:
+            close_price = get_binance_close_at_timestamp("BTCUSDT", target_ts_str)
+        except Exception:
+            continue
+
+        direction = str(context_data.get("direction", "")).upper()
+        if direction == "UP":
+            is_win = close_price > start_price
+        elif direction == "DOWN":
+            is_win = close_price < start_price
+        else:
+            continue
+
+        price_delta = close_price - start_price
+        status_label = "WON" if is_win else "LOST"
+        comparison_text = "above" if close_price > start_price else "below"
+        outcome_line = (
+            f"{status_label}: {direction} ({context_data.get('forecast_horizon_hours', '4')}H) "
+            f"forecast was {'correct' if is_win else 'incorrect'} because actual expiration close "
+            f"{close_price:.2f} was {comparison_text} starting price {start_price:.2f} "
+            f"(Delta: {price_delta:+.2f})."
+        )
+
+        context_data["expiration_close_price"] = f"{close_price:.2f}"
+        context_data["price_delta"] = f"{price_delta:+.2f}"
+        context_data["evaluation_status"] = status_label
+        context_data["audited"] = False
+
+        memory_match = re.search(r"\*\*Memory ID:\*\*\s*`([^`]+)`", content)
+        memory_id = memory_match.group(1) if memory_match else "unknown-memory"
+        header = f"# BTC-USD {direction} forecast\n\n**Memory ID:** `{memory_id}`\n\n## Outcome\n\n{outcome_line}\n\n## Full forecast and evaluation context\n\n"
+        updated_md = header + f"```json\n{json.dumps(context_data, indent=2)}\n```\n"
+        md_file.write_text(updated_md, encoding="utf-8")
+
+        if not is_win:
+            newly_lost_files.append(md_file)
+
+    return newly_lost_files
 
 
 def _read_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:

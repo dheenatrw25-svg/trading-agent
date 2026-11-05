@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0B0E14">
+  <title>PRO-TRADER AI | Market Intelligence</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root { color-scheme: dark; }
+    body { background: #0B0E14; font-family: Inter, sans-serif; }
+    .mono { font-family: "JetBrains Mono", ui-monospace, monospace; }
+    .glass { background: rgba(17, 24, 39, .72); backdrop-filter: blur(16px); }
+    .grid-bg {
+      background-image: linear-gradient(rgba(148,163,184,.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(148,163,184,.035) 1px, transparent 1px);
+      background-size: 32px 32px;
+    }
+    .pulse-dot { box-shadow: 0 0 0 0 rgba(52,211,153,.65); animation: pulse 1.8s infinite; }
+    @keyframes pulse { 70% { box-shadow: 0 0 0 8px rgba(52,211,153,0); } 100% { box-shadow: 0 0 0 0 rgba(52,211,153,0); } }
+    .spinner { border: 2px solid rgba(255,255,255,.25); border-top-color: #fff; animation: spin .8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .skeleton { background: linear-gradient(90deg, #17202d 25%, #202b3a 50%, #17202d 75%); background-size: 200% 100%; animation: shimmer 1.5s infinite; }
+    @keyframes shimmer { to { background-position: -200% 0; } }
+  </style>
+</head>
+<body class="min-h-screen text-slate-200 grid-bg">
+  <div class="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+    <header class="glass mb-6 flex flex-col gap-4 rounded-2xl border border-slate-700/60 px-5 py-4 shadow-2xl shadow-black/20 sm:flex-row sm:items-center sm:justify-between">
+      <div>
+        <div class="flex items-center gap-3">
+          <div class="flex h-10 w-10 items-center justify-center rounded-xl border border-emerald-400/20 bg-emerald-400/10 text-emerald-300">
+            <svg viewBox="0 0 24 24" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 17l6-6 4 3 8-9"/><path d="M15 5h6v6"/></svg>
+          </div>
+          <div>
+            <h1 class="text-lg font-bold tracking-[.16em] text-white">PRO-TRADER <span class="text-emerald-300">AI</span></h1>
+            <p class="mono text-[10px] uppercase tracking-[.22em] text-slate-500">Market intelligence terminal</p>
+          </div>
+        </div>
+      </div>
+      <div class="flex flex-wrap items-center gap-4">
+        <div class="flex items-center gap-2 rounded-full border border-emerald-400/15 bg-emerald-400/5 px-3 py-2">
+          <span class="pulse-dot h-2 w-2 rounded-full bg-emerald-400"></span>
+          <span class="mono text-xs text-emerald-300">Gemini Flash Core: Connected</span>
+        </div>
+        <span class="mono text-xs text-slate-500">BTC / USD</span>
+      </div>
+    </header>
+
+    <main class="space-y-6">
+      <section class="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <p class="mono mb-1 text-[11px] uppercase tracking-[.2em] text-slate-500">Decision support · probabilistic outlook</p>
+          <h2 class="text-2xl font-semibold text-white sm:text-3xl">Market overview</h2>
+        </div>
+        <button id="analyzeButton" type="button" class="inline-flex min-h-11 items-center justify-center gap-2 rounded-xl bg-emerald-400 px-5 py-3 font-semibold text-slate-950 shadow-lg shadow-emerald-950/30 transition hover:bg-emerald-300 disabled:cursor-not-allowed disabled:opacity-60">
+          <span id="buttonSpinner" class="spinner hidden h-4 w-4 rounded-full"></span>
+          <svg id="buttonIcon" viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 12a8 8 0 1 0 2.34-5.66"/><path d="M4 4v5h5"/></svg>
+          <span id="buttonLabel">Run Analysis</span>
+        </button>
+      </section>
+
+      <div id="errorBanner" class="hidden rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200" role="alert"></div>
+
+      <section class="grid gap-6 xl:grid-cols-[.92fr_1.08fr]">
+        <article class="glass rounded-2xl border border-slate-700/60 p-5 shadow-xl shadow-black/20 sm:p-6">
+          <div class="mb-6 flex items-start justify-between gap-4">
+            <div>
+              <p class="mono text-[10px] uppercase tracking-[.2em] text-slate-500">AI synthesis</p>
+              <h3 class="mt-1 text-lg font-semibold text-white">Trading advisory</h3>
+            </div>
+            <span id="directionTag" class="rounded-lg border border-slate-600 bg-slate-800/80 px-3 py-1.5 mono text-xs font-bold tracking-wider text-slate-400">AWAITING DATA</span>
+          </div>
+
+          <div class="mb-6 rounded-xl border border-slate-700/50 bg-slate-950/35 p-4">
+            <div class="mb-3 flex items-center justify-between">
+              <span class="text-sm text-slate-400">Conviction</span>
+              <span id="confidenceText" class="mono text-sm font-semibold text-white">— / 10</span>
+            </div>
+            <div class="h-2 overflow-hidden rounded-full bg-slate-800">
+              <div id="confidenceBar" class="h-full w-0 rounded-full bg-emerald-400 transition-all duration-700"></div>
+            </div>
+          </div>
+
+          <div class="mb-6 grid gap-3 sm:grid-cols-2">
+            <div class="rounded-xl border border-slate-700/50 bg-slate-950/35 p-4">
+              <p class="mb-2 text-xs text-slate-500">Target range</p>
+              <p id="targetRange" class="mono text-base font-semibold text-white">—</p>
+            </div>
+            <div class="rounded-xl border border-rose-400/15 bg-rose-400/[.04] p-4">
+              <p class="mb-2 text-xs text-slate-500">Hard invalidation</p>
+              <p id="invalidationPrice" class="mono text-base font-semibold text-rose-300">—</p>
+            </div>
+          </div>
+
+          <div class="mb-4">
+            <p class="mb-2 text-xs text-slate-500">Market regime</p>
+            <span id="marketRegime" class="inline-flex rounded-full border border-sky-400/20 bg-sky-400/5 px-3 py-1.5 text-xs font-medium text-sky-200">Awaiting analysis</span>
+          </div>
+          <div class="border-t border-slate-700/60 pt-4">
+            <p class="mb-2 text-xs uppercase tracking-wider text-slate-500">Synthesis reasoning</p>
+            <p id="reasoning" class="text-sm leading-6 text-slate-300">Run an analysis to load the latest market synthesis.</p>
+          </div>
+          <p class="mt-5 border-t border-slate-800 pt-4 text-[11px] leading-5 text-slate-500">AI-generated market analysis is probabilistic and may be inaccurate. It is not financial advice.</p>
+        </article>
+
+        <article class="glass overflow-hidden rounded-2xl border border-slate-700/60 shadow-xl shadow-black/20">
+          <div class="flex items-center justify-between border-b border-slate-700/60 px-5 py-4">
+            <div>
+              <p class="mono text-[10px] uppercase tracking-[.2em] text-slate-500">Price action</p>
+              <h3 class="mt-1 font-semibold text-white">Volume Profile · BTC-USD</h3>
+            </div>
+            <span id="chartStatus" class="mono text-[10px] text-slate-500">AWAITING CHART</span>
+          </div>
+          <div class="flex min-h-[300px] items-center justify-center bg-[#080b10] p-3 sm:min-h-[420px]">
+            <div id="chartPlaceholder" class="text-center">
+              <div class="skeleton mx-auto mb-3 h-8 w-8 rounded-full"></div>
+              <p class="text-sm text-slate-500">Run analysis to generate the latest chart.</p>
+            </div>
+            <img id="chartImage" class="hidden max-h-[520px] w-full rounded-lg object-contain" alt="BTC-USD candlestick chart with volume profile levels">
+          </div>
+          <div class="flex flex-wrap gap-x-5 gap-y-2 border-t border-slate-700/60 px-5 py-3 mono text-[10px] text-slate-400">
+            <span><i class="mr-1 inline-block h-2 w-2 rounded-full bg-yellow-300"></i>POC</span>
+            <span><i class="mr-1 inline-block h-2 w-2 rounded-full bg-cyan-300"></i>Value Area High / Low</span>
+            <span class="ml-auto text-slate-600">4H candles</span>
+          </div>
+        </article>
+      </section>
+
+      <section class="glass overflow-hidden rounded-2xl border border-slate-700/60 shadow-xl shadow-black/20">
+        <div class="flex flex-col gap-3 border-b border-slate-700/60 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <p class="mono text-[10px] uppercase tracking-[.2em] text-slate-500">Short-term memory</p>
+            <h3 class="mt-1 font-semibold text-white">Recent forecasts</h3>
+          </div>
+          <button id="refreshHistory" type="button" class="self-start rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 transition hover:border-slate-500 hover:text-white sm:self-auto">Refresh history</button>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full min-w-[620px] text-left">
+            <thead class="bg-slate-950/30 mono text-[10px] uppercase tracking-wider text-slate-500">
+              <tr>
+                <th class="px-5 py-3 font-medium">Timestamp</th>
+                <th class="px-5 py-3 font-medium">Direction</th>
+                <th class="px-5 py-3 font-medium">Price</th>
+                <th class="px-5 py-3 font-medium">Outcome</th>
+              </tr>
+            </thead>
+            <tbody id="historyBody" class="divide-y divide-slate-800/80 text-sm">
+              <tr><td colspan="4" class="px-5 py-8 text-center text-slate-500">Loading forecast history…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+    <footer class="py-6 text-center mono text-[10px] tracking-wider text-slate-600">PRO-TRADER AI · MARKET INTELLIGENCE TERMINAL</footer>
+  </div>
+
+  <script>
+    const byId = (id) => document.getElementById(id);
+    const analyzeButton = byId("analyzeButton");
+
+    function showError(message) {
+      const banner = byId("errorBanner");
+      banner.textContent = message;
+      banner.classList.remove("hidden");
+    }
+
+    function clearError() {
+      byId("errorBanner").classList.add("hidden");
+      byId("errorBanner").textContent = "";
+    }
+
+    function formatPrice(value) {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return "—";
+      return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(number);
+    }
+
+    function setLoading(loading) {
+      analyzeButton.disabled = loading;
+      byId("buttonSpinner").classList.toggle("hidden", !loading);
+      byId("buttonIcon").classList.toggle("hidden", loading);
+      byId("buttonLabel").textContent = loading ? "Analyzing…" : "Run Analysis";
+      if (loading) {
+        byId("chartStatus").textContent = "GENERATING";
+        byId("reasoning").textContent = "Fetching market data and generating the advisory…";
+      }
+    }
+
+    function renderAdvisory(data) {
+      const direction = String(data.direction || "UNKNOWN").toUpperCase();
+      const tag = byId("directionTag");
+      tag.textContent = direction;
+      tag.className = "rounded-lg border px-3 py-1.5 mono text-xs font-bold tracking-wider";
+      const directionStyles = {
+        UP: "border-emerald-400/30 bg-emerald-400/10 text-emerald-300",
+        DOWN: "border-rose-400/30 bg-rose-400/10 text-rose-300",
+        WAIT: "border-amber-400/30 bg-amber-400/10 text-amber-300",
+        NEUTRAL: "border-amber-400/30 bg-amber-400/10 text-amber-300"
+      };
+      tag.classList.add(...(directionStyles[direction] || "border-slate-600 bg-slate-800 text-slate-300").split(" "));
+
+      const confidence = Math.max(0, Math.min(10, Number(data.confidence_score) || 0));
+      byId("confidenceText").textContent = `${confidence} / 10`;
+      byId("confidenceBar").style.width = `${confidence * 10}%`;
+      byId("confidenceBar").className = `h-full rounded-full transition-all duration-700 ${confidence >= 7 ? "bg-emerald-400" : confidence >= 4 ? "bg-amber-400" : "bg-rose-400"}`;
+      byId("targetRange").textContent = `${formatPrice(data.target_range_low)} — ${formatPrice(data.target_range_high)}`;
+      byId("invalidationPrice").textContent = formatPrice(data.invalidation_price);
+      byId("marketRegime").textContent = data.market_regime || "Unspecified";
+      byId("reasoning").textContent = data.reasoning || "No reasoning was returned.";
+    }
+
+    async function loadChart() {
+      const image = byId("chartImage");
+      byId("chartPlaceholder").classList.remove("hidden");
+      byId("chartPlaceholder").querySelector("p").textContent = "Loading chart…";
+      image.classList.add("hidden");
+      image.onload = () => {
+        byId("chartPlaceholder").classList.add("hidden");
+        image.classList.remove("hidden");
+        byId("chartStatus").textContent = "LIVE CHART";
+      };
+      image.onerror = () => {
+        byId("chartPlaceholder").classList.remove("hidden");
+        byId("chartPlaceholder").querySelector("p").textContent = "Chart unavailable. Run analysis to generate it.";
+        byId("chartStatus").textContent = "NO CHART";
+      };
+      image.src = `/api/chart?ts=${Date.now()}`;
+    }
+
+    function renderHistory(rows) {
+      const body = byId("historyBody");
+      body.replaceChildren();
+      if (!Array.isArray(rows) || rows.length === 0) {
+        const tr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = 4;
+        td.className = "px-5 py-8 text-center text-slate-500";
+        td.textContent = "No forecasts logged yet.";
+        tr.append(td);
+        body.append(tr);
+        return;
+      }
+
+      for (const row of rows) {
+        const tr = document.createElement("tr");
+        tr.className = "transition hover:bg-white/[.02]";
+        const direction = String(row.direction || "UNKNOWN").toUpperCase();
+        const directionClass = direction === "UP" ? "text-emerald-300" : direction === "DOWN" ? "text-rose-300" : "text-amber-300";
+        const values = [
+          [row.timestamp || "—", "mono whitespace-nowrap text-xs text-slate-400"],
+          [direction, `mono text-xs font-bold ${directionClass}`],
+          [formatPrice(row.price), "mono text-xs text-slate-200"],
+          [row.outcome || "Pending", "text-xs text-slate-300"]
+        ];
+        for (const [value, className] of values) {
+          const td = document.createElement("td");
+          td.className = `px-5 py-4 ${className}`;
+          td.textContent = value;
+          tr.append(td);
+        }
+        body.append(tr);
+      }
+    }
+
+    async function loadHistory() {
+      const body = byId("historyBody");
+      body.innerHTML = '<tr><td colspan="4" class="px-5 py-8 text-center text-slate-500"><span class="skeleton inline-block h-4 w-40 rounded"></span></td></tr>';
+      try {
+        const response = await fetch("/api/history", { headers: { "Accept": "application/json" } });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || data.error || "Could not load history.");
+        renderHistory(data);
+      } catch (error) {
+        body.replaceChildren();
+        const tr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = 4;
+        td.className = "px-5 py-8 text-center text-rose-300";
+        td.textContent = `History unavailable: ${error.message}`;
+        tr.append(td);
+        body.append(tr);
+      }
+    }
+
+    async function runAnalysis() {
+      clearError();
+      setLoading(true);
+      try {
+        const response = await fetch("/api/analyze", { headers: { "Accept": "application/json" } });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || data.error || "Analysis request failed.");
+        renderAdvisory(data);
+        await loadChart();
+        await loadHistory();
+      } catch (error) {
+        showError(`Analysis failed: ${error.message}`);
+        byId("chartStatus").textContent = "ANALYSIS ERROR";
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    analyzeButton.addEventListener("click", runAnalysis);
+    byId("refreshHistory").addEventListener("click", loadHistory);
+    loadHistory();
+    loadChart();
+  </script>
+</body>
+</html>

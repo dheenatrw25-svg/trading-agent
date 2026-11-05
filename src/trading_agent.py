@@ -8,9 +8,9 @@ Reasoning via Gemini 2.5 Flash (API only — no local GPU).
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
-import os
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -26,7 +26,6 @@ import mplfinance as mpf
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from PIL import Image
@@ -34,7 +33,10 @@ from PIL import Image
 # ---------------------------------------------------------------------------
 # Paths & constants
 # ---------------------------------------------------------------------------
-from .paths import ASSETS_DIR, LOGS_DIR, PROJECT_ROOT
+from .paths import ASSETS_DIR, LOGS_DIR
+from . import gemini_utils, market_predictor
+from .prediction_logs import evaluate_pending_memories
+from .pro_strategist import evolve_playbook_from_losses
 
 STATE_PATH = LOGS_DIR / "agent_state.json"
 TRADES_PATH = LOGS_DIR / "paper_trades.csv"
@@ -48,7 +50,7 @@ GRADE_A_RISK_PCT = 0.015  # 1.5% of current balance
 GRADE_B_RISK_PCT = 0.0075  # 0.75% of current balance
 MIN_RR = 1.5
 
-GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_MODEL = gemini_utils.GEMINI_MODEL
 
 TRADE_CSV_FIELDS = [
     "Timestamp",
@@ -555,13 +557,7 @@ def compute_metrics(df_4h: pd.DataFrame, df_15m: pd.DataFrame) -> dict[str, Any]
 
 
 def get_genai_client() -> genai.Client:
-    load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "Missing API key. Set GEMINI_API_KEY (or GOOGLE_API_KEY) in the environment."
-        )
-    return genai.Client(api_key=api_key)
+    return gemini_utils.create_client()
 
 
 def ask_gemini(chart_path: Path, metrics: dict[str, Any], ticker: str) -> dict[str, Any]:
@@ -576,7 +572,8 @@ def ask_gemini(chart_path: Path, metrics: dict[str, Any], ticker: str) -> dict[s
         f"{json.dumps(metrics, indent=2)}"
     )
 
-    response = client.models.generate_content(
+    response = gemini_utils.generate_content_with_retry(
+        client,
         model=GEMINI_MODEL,
         contents=[
             types.Content(
@@ -589,20 +586,22 @@ def ask_gemini(chart_path: Path, metrics: dict[str, Any], ticker: str) -> dict[s
         ],
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
-            temperature=0.2,
             response_mime_type="application/json",
             response_json_schema=TRADE_DECISION_SCHEMA,
         ),
     )
 
-    raw = (response.text or "").strip()
+    raw = gemini_utils.response_text(response, "trade decision")
     if raw.startswith("```"):
         raw = raw.strip("`")
         if raw.lower().startswith("json"):
             raw = raw[4:]
         raw = raw.strip()
 
-    decision = json.loads(raw)
+    try:
+        decision = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Gemini trade decision response was not valid JSON.") from exc
     print(f"[AI] Decision: {json.dumps(decision)}")
     return decision
 
@@ -761,6 +760,18 @@ def run_agent(ticker: str) -> dict[str, Any]:
         f"Daily PnL ${float(state['daily_realized_pnl']):,.2f}  |  "
         f"Consecutive losses {state.get('consecutive_losses', 0)}"
     )
+
+    # 1) Grade expired memory files before any fresh forecast cycle.
+    lost_files = evaluate_pending_memories()
+    if lost_files:
+        print(f"[RUN] Found {len(lost_files)} expired LOST memory files; evolving playbook before forecast.")
+        asyncio.run(evolve_playbook_from_losses())
+    else:
+        print("[RUN] No expired LOST memory files detected.")
+
+    # 2) Re-run the 2H/4H forecast cycle with the updated vault playbook.
+    print("[RUN] Launching BTC 2H/4H forecast cycle with the updated playbook.")
+    market_predictor.run_predictor("BTC-USD")
 
     # Need extra 15m/60m history so EMA50 / RSI / ATR are fully warmed up
     # before we slice the visible window.

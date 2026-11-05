@@ -1,19 +1,22 @@
 import json
 import math
-import time
+import os
+import re
+import shutil
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
-from google import genai
 from google.genai import types
 from PIL import Image
 
-from . import chart_engine, data_engine
-from .evaluator import retrieve_past_lessons
-from .paths import ASSETS_DIR, PROJECT_ROOT
+try:
+    from openai import AsyncOpenAI
+except ImportError:  # pragma: no cover - handled at runtime if the package is absent.
+    AsyncOpenAI = None
 
-load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
+from . import chart_engine, data_engine, gemini_utils
+from .evaluator import retrieve_past_lessons
+from .paths import ASSETS_DIR, MASTER_PLAYBOOK_FILE, MEMORIES_DIR, PLAYBOOK_BACKUP_FILE, PROJECT_ROOT
 
 PRO_TRADER_PROMPT = """You are an elite institutional quantitative cryptocurrency analyst. Your objective is to provide highly accurate, probabilistic market forecasts with strict risk management.
 You have two inputs:
@@ -46,13 +49,28 @@ ADVISORY_FIELDS = {
     "market_regime",
     "reasoning",
 }
-GEMINI_MAX_RETRIES = 3
-GEMINI_RETRY_BACKOFF_SECONDS = 5
 ADVISORY_DIRECTIONS = {"UP", "DOWN"}
+
+STRATEGIST_SYSTEM_PROMPT = """You are the Autonomous Playbook Auditor for a BTC-USD binary forecasting agent.
+We evaluate trades strictly on whether the expiration close is above or below `btc_price_at_prediction` (starting price), NOT on high/low price ranges.
+
+STRICT RULES FOR UPDATING THE PLAYBOOK:
+1. HORIZON ISOLATION: Check `forecast_horizon_hours` in the failed trade JSON. If it is "2", ONLY update `## 2. 2-Hour (2H) Horizon Rules` or `## 4. Invalidated Setups`. If it is "4", ONLY update `## 3. 4-Hour (4H) Horizon Rules` or `## 4. Invalidated Setups`.
+2. VERIFIABLE METRICS ONLY: Base rule adjustments strictly on `btc_price_at_prediction`, Volume Profile (`poc_price`, `value_area_high`, `value_area_low`), candle structure, and volume.
+3. NO CONTRADICTIONS: Merge new conditions into existing rules using `IF / UNLESS` logic rather than piling up conflicting bullets.
+4. OUTPUT: Return ONLY the complete, updated Markdown text starting with `# BTC-USD Autonomous Forecasting Playbook`."""
 
 
 def load_playbook() -> str:
-    playbook_path = PROJECT_ROOT / "trading_playbook.md"
+    playbook_candidates = [MASTER_PLAYBOOK_FILE, PROJECT_ROOT / "trading_playbook.md"]
+    playbook_path: Path | None = None
+    for candidate in playbook_candidates:
+        if candidate is not None and candidate.exists():
+            playbook_path = candidate
+            break
+
+    if playbook_path is None:
+        playbook_path = MASTER_PLAYBOOK_FILE
     try:
         playbook = playbook_path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
@@ -64,6 +82,75 @@ def load_playbook() -> str:
     if not playbook.strip():
         raise ValueError(f"Trading playbook is empty: {playbook_path}")
     return playbook
+
+
+async def evolve_playbook_from_losses() -> list[Path]:
+    """Find LOST memory files in the vault and evolve the active master playbook."""
+    if AsyncOpenAI is None:
+        raise ImportError("The openai package is required to evolve the playbook from DeepSeek losses.")
+
+    current_playbook = load_playbook()
+    updated_files: list[Path] = []
+    client = AsyncOpenAI(
+        api_key=os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY"),
+        base_url="https://api.deepseek.com/v1",
+    )
+
+    for md_file in sorted(MEMORIES_DIR.glob("*.md")):
+        content = md_file.read_text(encoding="utf-8")
+        if "LOST:" not in content:
+            continue
+
+        match = re.search(r"```json\s*(\{.*?\})\s*```", content, flags=re.DOTALL)
+        if not match:
+            continue
+
+        try:
+            context_data = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+
+        if context_data.get("audited") is True:
+            continue
+
+        print(f"[PRO STRATEGIST] Auditing failed memory: {md_file.name}...")
+
+        user_prompt = (
+            f"### CURRENT PLAYBOOK (`01_Playbooks/master_playbook.md`):\n{current_playbook}\n\n"
+            f"### FAILED TRADE MEMORY (`02_Trade_Memories/{md_file.name}`):\n{content}\n\n"
+            "Identify why the forecast direction failed relative to `btc_price_at_prediction` and output the updated Playbook."
+        )
+
+        response = await client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": STRATEGIST_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.15,
+        )
+
+        updated_playbook = response.choices[0].message.content.strip()
+        if updated_playbook.startswith("```"):
+            updated_playbook = "\n".join(updated_playbook.splitlines()[1:-1]).strip()
+
+        if "# BTC-USD Autonomous Forecasting Playbook" in updated_playbook and len(updated_playbook) > 150:
+            shutil.copyfile(MASTER_PLAYBOOK_FILE, PLAYBOOK_BACKUP_FILE)
+            MASTER_PLAYBOOK_FILE.write_text(updated_playbook, encoding="utf-8")
+            current_playbook = updated_playbook
+
+            context_data["audited"] = True
+            updated_content = re.sub(
+                r"```json\s*\{.*?\}\s*```",
+                f"```json\n{json.dumps(context_data, indent=2)}\n```",
+                content,
+                flags=re.DOTALL,
+            )
+            md_file.write_text(updated_content, encoding="utf-8")
+            updated_files.append(md_file)
+            print(f"[PRO STRATEGIST] Playbook updated and {md_file.name} marked as audited.")
+
+    return updated_files
 
 
 def calculate_risk_reward(
@@ -341,45 +428,28 @@ def generate_trading_advisory(
             sort_keys=True,
         )
     past_lessons = retrieve_past_lessons(regime_context)
-    client = genai.Client()
+    client = gemini_utils.create_client()
 
     with Image.open(image_path) as chart_image:
-        for attempt in range(GEMINI_MAX_RETRIES + 1):
-            try:
-                response = client.models.generate_content(
-                    model="gemini-3.8-flash",
-                    contents=[
-                        PRO_TRADER_PROMPT,
-                        f"Four-hour trading playbook:\n{playbook}",
-                        data_string,
-                        f"Supporting market details:\n{supporting_data_string}",
-                        f"Relevant lessons from past trades:\n{past_lessons}",
-                        chart_image,
-                    ],
-                    config=types.GenerateContentConfig(
-                        temperature=0.2,
-                        response_mime_type="application/json",
-                    ),
-                )
-                break
-            except Exception as exc:
-                error_text = str(exc).upper()
-                retryable = any(
-                    marker in error_text for marker in ("503", "429", "UNAVAILABLE")
-                )
-                if not retryable or attempt == GEMINI_MAX_RETRIES:
-                    raise RuntimeError(
-                        f"Gemini 4-hour forecast request failed: {exc}"
-                    ) from exc
-                delay = GEMINI_RETRY_BACKOFF_SECONDS * (2 ** attempt)
-                print(
-                    f"[API] Gemini servers busy. Retrying attempt "
-                    f"{attempt + 1}/{GEMINI_MAX_RETRIES} in {delay} seconds..."
-                )
-                time.sleep(delay)
+        response = gemini_utils.generate_content_with_retry(
+            client,
+            model=gemini_utils.GEMINI_MODEL,
+            contents=[
+                PRO_TRADER_PROMPT,
+                f"Four-hour trading playbook:\n{playbook}",
+                data_string,
+                f"Supporting market details:\n{supporting_data_string}",
+                f"Relevant lessons from past trades:\n{past_lessons}",
+                chart_image,
+            ],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+            ),
+        )
 
     try:
-        advisory = validate_advisory(json.loads(response.text))
+        text = gemini_utils.response_text(response, "4-hour advisory")
+        advisory = validate_advisory(json.loads(text))
         return _apply_python_strategy_checks(advisory, market_context)
     except json.JSONDecodeError as exc:
         print(f"[AI] Gemini returned invalid JSON: {exc}")
