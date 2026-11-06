@@ -219,10 +219,16 @@ def _forecast_details(
         raise PaperTradeError(
             f"{forecast_type} forecast horizon must be {required_horizon} hours."
         )
-    if target - issue != datetime.timedelta(hours=required_horizon):
+    duration = target - issue
+    expected_duration = datetime.timedelta(hours=required_horizon)
+    if not (
+        expected_duration <= duration < expected_duration + datetime.timedelta(minutes=1)
+        and target.second == 0
+        and target.microsecond == 0
+    ):
         raise PaperTradeError(
-            f"{forecast_type} forecast timestamps do not span exactly "
-            f"{required_horizon} hours."
+            f"{forecast_type} forecast timestamps must span the requested horizon "
+            "and end on an exact minute boundary."
         )
     if not reference:
         raise PaperTradeError("Forecast reference is missing.")

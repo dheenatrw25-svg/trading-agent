@@ -1,4 +1,6 @@
 import json
+import datetime
+import email.utils
 import unittest
 from unittest.mock import Mock, patch
 
@@ -8,6 +10,102 @@ from src import market_predictor
 
 
 class MarketPredictorHttpTests(unittest.TestCase):
+    def test_binance_spot_price_is_used_only_when_quote_is_fresh(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"symbol": "BTCUSDT", "price": "65000.25"}
+        response.headers = {
+            "Date": email.utils.format_datetime(
+                datetime.datetime.now(datetime.timezone.utc),
+                usegmt=True,
+            )
+        }
+
+        with patch.object(market_predictor.requests, "get", return_value=response) as get:
+            price, quoted_at = market_predictor.fetch_binance_spot_price()
+
+        get.assert_called_once_with(
+            market_predictor.BINANCE_SPOT_URL,
+            params={"symbol": "BTCUSDT"},
+            timeout=market_predictor.MARKET_DATA_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(price, 65000.25)
+        self.assertLessEqual(
+            abs(
+                (
+                    datetime.datetime.now(datetime.timezone.utc) - quoted_at
+                ).total_seconds()
+            ),
+            market_predictor.BINANCE_PRICE_MAX_AGE_SECONDS,
+        )
+
+    def test_binance_spot_price_rejects_stale_or_unverifiable_quotes(self):
+        stale_response = Mock()
+        stale_response.raise_for_status.return_value = None
+        stale_response.json.return_value = {"price": "65000.25"}
+        stale_response.headers = {
+            "Date": email.utils.format_datetime(
+                datetime.datetime.now(datetime.timezone.utc)
+                - datetime.timedelta(seconds=market_predictor.BINANCE_PRICE_MAX_AGE_SECONDS + 10),
+                usegmt=True,
+            )
+        }
+        with (
+            patch.object(market_predictor.requests, "get", return_value=stale_response),
+            self.assertRaisesRegex(RuntimeError, "stale or future-dated"),
+        ):
+            market_predictor.fetch_binance_spot_price()
+
+        stale_response.headers = {}
+        with (
+            patch.object(market_predictor.requests, "get", return_value=stale_response),
+            self.assertRaisesRegex(RuntimeError, "no Date header"),
+        ):
+            market_predictor.fetch_binance_spot_price()
+
+    def test_run_predictor_uses_live_binance_quote_as_forecast_baseline(self):
+        execution_timestamp = datetime.datetime(
+            2026, 1, 1, 12, 0, tzinfo=datetime.timezone.utc
+        )
+        metrics = {
+            "current_price": 99.0,
+            "source_candle_timestamp": "2026-01-01T11:45:00+00:00",
+        }
+        forecast = {
+            "predicted_direction": "BULLISH",
+            "confidence_score": 7,
+            "expected_high_next_2h": 110.0,
+            "expected_low_next_2h": 90.0,
+            "projected_price_in_2h": 105.0,
+            "predicted_scenario": "BTC may rise over the next two hours.",
+        }
+        with (
+            patch.object(
+                market_predictor,
+                "generate_dual_chart",
+                return_value=(object(), object(), "chart.png"),
+            ),
+            patch.object(market_predictor, "calculate_metrics", return_value=metrics),
+            patch.object(
+                market_predictor,
+                "fetch_binance_spot_price",
+                return_value=(100.123456, execution_timestamp),
+            ),
+            patch.object(
+                market_predictor,
+                "predict_next_2_hours",
+                return_value=forecast,
+            ),
+            patch.object(market_predictor, "log_prediction", return_value={"saved": True}) as log,
+        ):
+            result = market_predictor.run_predictor()
+
+        self.assertEqual(result, {"saved": True})
+        self.assertEqual(metrics["current_price"], 100.123456)
+        self.assertEqual(metrics["btc_price_at_prediction"], 100.123456)
+        self.assertEqual(metrics["execution_timestamp"], execution_timestamp.isoformat())
+        self.assertEqual(log.call_args.kwargs["issued_at"], execution_timestamp)
+
     def test_gemini_request_uses_the_shared_client_factory(self):
         prediction = {
             "predicted_direction": "BULLISH",
@@ -38,6 +136,40 @@ class MarketPredictorHttpTests(unittest.TestCase):
 
         factory.assert_called_once_with()
         self.assertEqual(result["predicted_direction"], "BULLISH")
+
+    def test_two_hour_prompt_includes_master_playbook_and_two_hour_lessons(self):
+        prediction = {
+            "predicted_direction": "BULLISH",
+            "confidence_score": 7,
+            "expected_high_next_2h": 110.0,
+            "expected_low_next_2h": 90.0,
+            "projected_price_in_2h": 105.0,
+            "predicted_scenario": "BTC may rise over the next two hours.",
+        }
+        client = Mock()
+        client.models.generate_content.return_value = Mock(text=json.dumps(prediction))
+        with (
+            patch.object(market_predictor.gemini_utils, "create_client", return_value=client),
+            patch.object(Image, "open", return_value=object()),
+            patch(
+                "src.pro_strategist.load_playbook",
+                return_value="EVOLVED MASTER RULES",
+            ),
+            patch(
+                "src.evaluator.retrieve_past_lessons",
+                return_value="2H LOSS LESSONS",
+            ) as lessons,
+        ):
+            market_predictor.predict_next_2_hours(
+                "forecast.png",
+                {"current_price": 100.0, "macro_trend": "BULLISH"},
+                "BTC-USD",
+            )
+
+        lessons.assert_called_once_with("BULLISH", forecast_horizon_hours=2)
+        contents = client.models.generate_content.call_args.kwargs["contents"]
+        self.assertIn("EVOLVED MASTER RULES", contents[0])
+        self.assertIn("2H LOSS LESSONS", contents[1])
 
     def test_gemini_busy_response_retries_with_exponential_backoff(self):
         prediction = {

@@ -22,6 +22,7 @@ from .prediction_logs import (
     append_forecast_result,
     FORECAST_RESULTS_FILE,
     FORECAST_RESULTS_FIELDS,
+    forecast_expiration_timestamp,
     initialize_advisory_log,
     initialize_forecast_results_log,
     to_utc_iso,
@@ -48,9 +49,15 @@ def log_prediction(
     decision_json = pro_strategist.validate_advisory(decision_json)
     if spot_data.empty:
         raise ValueError("Cannot log a forecast without confirmed BTC candles.")
-    issue_time = issue_time or utc_now()
+    execution_timestamp = market_context.get("execution_timestamp")
+    if execution_timestamp:
+        issue_time = pd.Timestamp(execution_timestamp).to_pydatetime()
+    else:
+        issue_time = issue_time or utc_now()
     issue_timestamp = to_utc_iso(issue_time)
-    source_timestamp = pd.Timestamp(spot_data.index[-1])
+    source_timestamp = pd.Timestamp(
+        market_context.get("source_candle_timestamp", spot_data.index[-1])
+    )
     if source_timestamp.tzinfo is None:
         raise ValueError("Source candle timestamp must include a timezone.")
     source_timestamp = source_timestamp.tz_convert("UTC")
@@ -61,7 +68,7 @@ def log_prediction(
         "forecast_issue_timestamp": issue_timestamp,
         "source_candle_timestamp": source_timestamp.isoformat(),
         "target_timestamp": to_utc_iso(
-            issue_time + datetime.timedelta(hours=FORECAST_HORIZON_HOURS)
+            forecast_expiration_timestamp(issue_time, FORECAST_HORIZON_HOURS)
         ),
         "forecast_horizon_hours": FORECAST_HORIZON_HOURS,
         "btc_price_at_prediction": market_context["spot"]["current_close"],
@@ -112,7 +119,8 @@ def dashboard() -> HTMLResponse:
 def analyze() -> dict[str, Any] | JSONResponse:
     try:
         with ANALYSIS_LOCK:
-            spot_data = data_engine.fetch_spot_data()
+            execution_timestamp = utc_now()
+            spot_data = data_engine.fetch_spot_data(execution_timestamp)
             market_context = data_engine.compile_market_context(spot_data=spot_data)
             volume_profile = chart_engine.generate_pro_chart(
                 spot_data,
@@ -126,12 +134,18 @@ def analyze() -> dict[str, Any] | JSONResponse:
                 full_context,
                 chart_image_path=str(CHART_FILE),
             )
-            issue_time = utc_now()
+            issue_time = pd.Timestamp(
+                market_context.get(
+                    "execution_timestamp", execution_timestamp.isoformat()
+                )
+            ).to_pydatetime()
             paper_forecast = {
                 **decision,
                 "forecast_issue_timestamp": to_utc_iso(issue_time),
                 "target_timestamp": to_utc_iso(
-                    issue_time + datetime.timedelta(hours=FORECAST_HORIZON_HOURS)
+                    forecast_expiration_timestamp(
+                        issue_time, FORECAST_HORIZON_HOURS
+                    )
                 ),
                 "forecast_horizon_hours": FORECAST_HORIZON_HOURS,
             }
@@ -142,6 +156,7 @@ def analyze() -> dict[str, Any] | JSONResponse:
             except Exception as exc:
                 paper_status = {"status": "error", "reason": str(exc)}
             decision["polymarket_paper"] = paper_status
+            decision["execution_timestamp"] = to_utc_iso(issue_time)
             log_prediction(decision, market_context, spot_data, issue_time)
             return decision
     except Exception as exc:

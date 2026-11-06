@@ -132,38 +132,91 @@ def get_binance_close_at_timestamp(symbol: str, target_ts_iso: str) -> float:
     except ValueError as exc:
         raise ValueError(f"Invalid target timestamp: {target_ts_iso!r}") from exc
 
-    ts_ms = int(dt.timestamp() * 1000)
-    url = (
-        "https://api.binance.com/api/v3/klines"
-        f"?symbol={symbol.upper()}&interval=1m&startTime={ts_ms}&limit=1"
-    )
-    response = requests.get(url, timeout=10)
-    response.raise_for_status()
-    data = response.json()
-    if data:
-        return float(data[0][4])
-
-    live_response = requests.get(
-        f"https://api.binance.com/api/v3/ticker/price?symbol={symbol.upper()}",
+    if dt.tzinfo is None:
+        raise ValueError("target_ts_iso must include a timezone.")
+    if dt.microsecond:
+        raise ValueError(
+            "Exact Binance 1-minute expiry closes require minute-aligned timestamps."
+        )
+    target_ms = int(dt.timestamp() * 1000)
+    if target_ms % 60_000:
+        raise ValueError(
+            "Exact Binance 1-minute expiry closes require a minute-aligned timestamp."
+        )
+    candle_open_ms = target_ms - 60_000
+    response = requests.get(
+        "https://api.binance.com/api/v3/klines",
+        params={
+            "symbol": symbol.upper(),
+            "interval": "1m",
+            "startTime": candle_open_ms,
+            "endTime": target_ms - 1,
+            "limit": 1,
+        },
         timeout=10,
     )
-    live_response.raise_for_status()
-    live_payload = live_response.json()
-    return float(live_payload["price"])
+    response.raise_for_status()
+    data = response.json()
+    if (
+        not isinstance(data, list)
+        or not data
+        or not isinstance(data[0], (list, tuple))
+        or len(data[0]) < 7
+    ):
+        raise RuntimeError(
+            f"Binance returned no historical 1-minute candle for {target_ts_iso}."
+        )
+    try:
+        open_time_ms = int(data[0][0])
+        close_price = float(data[0][4])
+        close_time_ms = int(data[0][6])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Binance returned an invalid historical candle for {target_ts_iso}."
+        ) from exc
+    if open_time_ms != candle_open_ms or close_time_ms + 1 != target_ms:
+        raise RuntimeError(
+            f"Binance returned a candle that does not close at {target_ts_iso}."
+        )
+    if not math.isfinite(close_price) or close_price <= 0:
+        raise RuntimeError(
+            f"Binance returned an invalid historical close for {target_ts_iso}."
+        )
+    return close_price
 
 
-def evaluate_pending_memories() -> list[Path]:
+def forecast_expiration_timestamp(
+    issue_timestamp: datetime.datetime,
+    horizon_hours: int,
+) -> datetime.datetime:
+    if issue_timestamp.tzinfo is None:
+        raise ValueError("Forecast issue timestamp must include a timezone.")
+    if horizon_hours not in (2, 4):
+        raise ValueError("Forecast horizon must be two or four hours.")
+    nominal_expiry = issue_timestamp.astimezone(
+        datetime.timezone.utc
+    ) + datetime.timedelta(hours=horizon_hours)
+    aligned_expiry = nominal_expiry.replace(second=0, microsecond=0)
+    if aligned_expiry < nominal_expiry:
+        aligned_expiry += datetime.timedelta(minutes=1)
+    return aligned_expiry
+
+
+def evaluate_pending_memories(
+    now: datetime.datetime | None = None,
+) -> list[Path]:
     """
     Scan memory files in vault/02_Trade_Memories and grade expired forecasts using
     starting price vs. expiration close only. This ignores intra-window highs/lows.
     """
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if now.tzinfo is None:
+        raise ValueError("Memory evaluation time must include a timezone.")
+    now = now.astimezone(datetime.timezone.utc)
     newly_lost_files: list[Path] = []
 
     for md_file in sorted(MEMORIES_DIR.glob("*.md")):
         content = md_file.read_text(encoding="utf-8")
-        if "WON:" in content or "LOST:" in content:
-            continue
 
         match = re.search(r"```json\s*(\{.*?\})\s*```", content, flags=re.DOTALL)
         if not match:
@@ -174,7 +227,20 @@ def evaluate_pending_memories() -> list[Path]:
         except json.JSONDecodeError:
             continue
 
-        target_ts_str = context_data.get("target_timestamp")
+        if context_data.get("evaluation_status") in {"WIN", "LOSS", "WON", "LOST"}:
+            continue
+        if (
+            "**WIN.**" in content
+            or "**LOSS.**" in content
+            or "WON:" in content
+            or "LOST:" in content
+        ):
+            continue
+
+        target_ts_str = context_data.get(
+            "intended_evaluation_timestamp",
+            context_data.get("target_timestamp"),
+        )
         if not target_ts_str:
             continue
 
@@ -182,32 +248,57 @@ def evaluate_pending_memories() -> list[Path]:
             target_dt = datetime.datetime.fromisoformat(target_ts_str.replace("Z", "+00:00"))
         except ValueError:
             continue
-        if now < target_dt.replace(tzinfo=datetime.timezone.utc):
+        if target_dt.tzinfo is None:
+            continue
+        target_dt = target_dt.astimezone(datetime.timezone.utc)
+        if now < target_dt:
             continue
 
         try:
-            start_price = float(context_data["btc_price_at_prediction"])
+            horizon = int(context_data["forecast_horizon_hours"])
+            issue_ts_str = context_data.get(
+                "forecast_issue_timestamp", context_data.get("timestamp")
+            )
+            issue_dt = datetime.datetime.fromisoformat(
+                str(issue_ts_str).replace("Z", "+00:00")
+            )
+            expected_target = forecast_expiration_timestamp(issue_dt, horizon)
+            if target_dt != expected_target:
+                continue
         except (KeyError, TypeError, ValueError):
             continue
-
         try:
-            close_price = get_binance_close_at_timestamp("BTCUSDT", target_ts_str)
-        except Exception:
+            start_price = float(
+                context_data.get(
+                    "starting_btc_price",
+                    context_data.get("btc_price_at_prediction"),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
             continue
+        if horizon not in (2, 4) or not math.isfinite(start_price) or start_price <= 0:
+            continue
+        close_price = get_binance_close_at_timestamp("BTCUSDT", target_ts_str)
 
-        direction = str(context_data.get("direction", "")).upper()
-        if direction == "UP":
+        direction = str(
+            context_data.get("predicted_direction") or context_data.get("direction", "")
+        ).upper()
+        if direction in {"UP", "BULLISH"}:
             is_win = close_price > start_price
-        elif direction == "DOWN":
+        elif direction in {"DOWN", "BEARISH"}:
             is_win = close_price < start_price
         else:
             continue
 
         price_delta = close_price - start_price
-        status_label = "WON" if is_win else "LOST"
-        comparison_text = "above" if close_price > start_price else "below"
+        status_label = "WIN" if is_win else "LOSS"
+        comparison_text = (
+            "above" if close_price > start_price
+            else "below" if close_price < start_price
+            else "equal to"
+        )
         outcome_line = (
-            f"{status_label}: {direction} ({context_data.get('forecast_horizon_hours', '4')}H) "
+            f"{status_label}: {direction} ({horizon}H) "
             f"forecast was {'correct' if is_win else 'incorrect'} because actual expiration close "
             f"{close_price:.2f} was {comparison_text} starting price {start_price:.2f} "
             f"(Delta: {price_delta:+.2f})."

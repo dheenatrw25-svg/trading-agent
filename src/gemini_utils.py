@@ -12,7 +12,7 @@ from google.genai import types
 from .paths import PROJECT_ROOT
 
 
-GEMINI_MODEL = "gemini-3.0-flash"
+GEMINI_MODEL = "gemini-3-flash-preview"
 GEMINI_REQUEST_TIMEOUT_MS = 120_000
 GEMINI_MAX_ATTEMPTS = 3
 GEMINI_RETRY_BACKOFF_SECONDS = 5

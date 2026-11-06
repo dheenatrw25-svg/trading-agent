@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 import pandas as pd
 
-from src import auto_run, evaluator, market_predictor, polymarket_client, polymarket_paper
+from src import auto_run, market_predictor, polymarket_client, polymarket_paper
 
 
 UTC = datetime.timezone.utc
@@ -171,6 +171,26 @@ class PolymarketPaperTests(unittest.TestCase):
         self.assertEqual(logged["status"], "SKIPPED")
         self.assertTrue(logged["skip_reason"])
 
+    def test_minute_aligned_expiry_keeps_rounded_forecast_duration_valid(self):
+        issue = WINDOW_START + datetime.timedelta(seconds=25)
+        target = WINDOW_START + datetime.timedelta(hours=2, minutes=1)
+        forecast = {
+            "forecast_id": "forecast-aligned-expiry",
+            "forecast_issue_timestamp": issue.isoformat(),
+            "intended_evaluation_timestamp": target.isoformat(),
+            "forecast_horizon_hours": "2",
+            "predicted_direction": "BULLISH",
+        }
+        result = self.process(
+            forecast,
+            "forecast",
+            MockPolymarketClient(markets=[market_for(2)]),
+            now=issue,
+        )
+
+        self.assertEqual(result["status"], "entered")
+        self.assertEqual(result["trade"]["market_id"], "btc-window-2h")
+
     def test_missing_market_is_logged_with_reason(self):
         result = self.process(
             advisory_row(), "advisory", MockPolymarketClient(markets=[])
@@ -265,7 +285,7 @@ class PolymarketPaperTests(unittest.TestCase):
             WINDOW_START + datetime.timedelta(seconds=1)
         ).isoformat()
         second_row["target_timestamp"] = (
-            WINDOW_START + datetime.timedelta(hours=4, seconds=1)
+            WINDOW_START + datetime.timedelta(hours=4, minutes=1)
         ).isoformat()
         second = self.process(second_row, "advisory", api)
         self.assertEqual(first["status"], "entered")
@@ -371,40 +391,30 @@ class PolymarketPaperTests(unittest.TestCase):
         self.assertIn("https://clob.polymarket.com/price", urls[2])
         self.assertIn("https://gamma-api.polymarket.com/markets/market", urls[3])
 
-    def test_scheduler_sends_new_two_hour_forecast_to_paper_engine_and_evaluator(self):
+    def test_scheduler_grades_and_evolves_before_new_two_hour_forecast(self):
         forecast = forecast_row(2)
+        events = []
         with (
-            patch.object(market_predictor, "run_predictor", return_value=forecast),
+            patch.object(
+                auto_run,
+                "_evaluate_and_evolve_before_forecast",
+                side_effect=lambda: events.append("evaluate-and-evolve"),
+            ),
+            patch.object(
+                market_predictor,
+                "run_predictor",
+                side_effect=lambda ticker: events.append("forecast") or forecast,
+            ),
             patch.object(
                 polymarket_paper,
                 "process_forecast",
                 return_value={"status": "entered"},
             ) as process_forecast,
-            patch.object(
-                evaluator,
-                "grade_pending_predictions",
-                return_value={
-                    "graded": 0,
-                    "pending": 0,
-                    "needs_review": 0,
-                    "errors": 0,
-                },
-            ) as grade_forecasts,
-            patch.object(
-                evaluator,
-                "grade_pending_advisories",
-                return_value={
-                    "graded": 0,
-                    "pending": 0,
-                    "needs_review": 0,
-                    "errors": 0,
-                },
-            ),
         ):
             auto_run.run_market_prediction()
 
         process_forecast.assert_called_once_with(forecast, "forecast")
-        grade_forecasts.assert_called_once_with()
+        self.assertEqual(events, ["evaluate-and-evolve", "forecast"])
 
     def test_scheduler_sends_new_four_hour_advisory_to_paper_engine(self):
         source_time = WINDOW_START - datetime.timedelta(minutes=15)
@@ -434,6 +444,7 @@ class PolymarketPaperTests(unittest.TestCase):
                 return_value=advisory,
             ),
             patch.object(auto_run, "_validate_advisory", return_value=True),
+            patch.object(auto_run, "_evaluate_and_evolve_before_forecast"),
             patch.object(auto_run, "initialize_csv"),
             patch.object(auto_run, "utc_now", return_value=WINDOW_START),
             patch.object(auto_run, "append_record"),

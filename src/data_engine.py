@@ -15,7 +15,18 @@ ORDER_BOOK_PRICE_BIN_USD = 10.0
 INSTITUTIONAL_WALL_THRESHOLD_USD = 1_000_000.0
 
 
-def _confirmed_candles(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+def _execution_timestamp(value: pd.Timestamp | None = None) -> pd.Timestamp:
+    timestamp = pd.Timestamp.now(tz="UTC") if value is None else pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        raise ValueError("Execution timestamp must include a timezone.")
+    return timestamp.tz_convert("UTC")
+
+
+def _confirmed_candles(
+    df: pd.DataFrame,
+    interval: str,
+    execution_timestamp: pd.Timestamp | None = None,
+) -> pd.DataFrame:
     if df.empty:
         raise RuntimeError("yfinance returned no BTC-USD spot candles.")
     required_columns = {"Open", "High", "Low", "Close", "Volume"}
@@ -29,8 +40,8 @@ def _confirmed_candles(df: pd.DataFrame, interval: str) -> pd.DataFrame:
 
     interval_delta = pd.Timedelta(interval)
     timestamps = pd.to_datetime(df.index, utc=True, errors="coerce")
-    now_utc = pd.Timestamp.now(tz="UTC")
-    confirmed = timestamps.notna() & (timestamps + interval_delta <= now_utc)
+    cutoff = _execution_timestamp(execution_timestamp)
+    confirmed = timestamps.notna() & (timestamps + interval_delta <= cutoff)
     result = df.loc[confirmed].copy()
     result.index = timestamps[confirmed]
     result = result.loc[~result.index.duplicated(keep="last")].sort_index()
@@ -67,30 +78,39 @@ def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def fetch_spot_data() -> pd.DataFrame:
+def fetch_spot_data(
+    execution_timestamp: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    execution_timestamp = _execution_timestamp(execution_timestamp)
     print("[DATA] Fetching BTC-USD spot candles (4h, 15d)...")
     df = yf.download(
         "BTC-USD",
-        period="15d",
+        start=(execution_timestamp - pd.Timedelta(days=15)).to_pydatetime(),
+        end=execution_timestamp.to_pydatetime(),
         interval="4h",
         progress=False,
     )
     df = _flatten_columns(df)
-    df = _confirmed_candles(df, "4h")
+    df = _confirmed_candles(df, "4h", execution_timestamp)
+    df.attrs["execution_timestamp"] = execution_timestamp.isoformat()
     print(f"[DATA] Retrieved {len(df)} spot candles.")
     return df
 
 
-def _fetch_15m_indicators() -> dict[str, float]:
+def _fetch_15m_indicators(
+    execution_timestamp: pd.Timestamp | None = None,
+) -> dict[str, Any]:
+    execution_timestamp = _execution_timestamp(execution_timestamp)
     print("[DATA] Fetching BTC-USD 15-minute candles for RSI...")
     df = yf.download(
         "BTC-USD",
-        period="5d",
+        start=(execution_timestamp - pd.Timedelta(days=5)).to_pydatetime(),
+        end=execution_timestamp.to_pydatetime(),
         interval="15m",
         progress=False,
     )
     df = _flatten_columns(df)
-    confirmed = _confirmed_candles(df, "15m")
+    confirmed = _confirmed_candles(df, "15m", execution_timestamp)
     close = confirmed["Close"].astype(float)
     delta = close.diff()
     average_gain = delta.clip(lower=0).ewm(
@@ -119,6 +139,9 @@ def _fetch_15m_indicators() -> dict[str, float]:
     return {
         "current_price": latest_close,
         "rsi_15m": round(rsi, 2),
+        "source_candle_timestamp": (
+            pd.Timestamp(confirmed.index[-1]) + pd.Timedelta(minutes=15)
+        ).isoformat(),
     }
 
 
@@ -563,8 +586,11 @@ def fetch_derivatives_data(symbol: str = "BTCUSDT") -> dict[str, Any]:
     }
 
 
-def _build_price_action_context(spot_data: pd.DataFrame) -> dict[str, Any]:
-    confirmed = _confirmed_candles(spot_data, "4h")
+def _build_price_action_context(
+    spot_data: pd.DataFrame,
+    execution_timestamp: pd.Timestamp | None = None,
+) -> dict[str, Any]:
+    confirmed = _confirmed_candles(spot_data, "4h", execution_timestamp)
     latest = confirmed.iloc[-1]
     latest_timestamp = pd.Timestamp(confirmed.index[-1])
     latest_volume = float(latest["Volume"])
@@ -661,15 +687,22 @@ def compile_market_context(spot_data: pd.DataFrame | None = None) -> dict[str, A
         spot_data = fetch_spot_data()
     if spot_data.empty:
         raise RuntimeError("Cannot compile market context from empty BTC-USD candles.")
-    price_action = _build_price_action_context(spot_data)
-    _confirmed_candles(spot_data, "4h")
+    execution_timestamp = _execution_timestamp(
+        spot_data.attrs.get("execution_timestamp")
+    )
+    price_action = _build_price_action_context(spot_data, execution_timestamp)
+    _confirmed_candles(spot_data, "4h", execution_timestamp)
     macro_context = fetch_macro_context()
     derivatives_data = fetch_derivatives_data()
     order_book_data = fetch_order_book_walls()
-    technical_indicators = _fetch_15m_indicators()
+    technical_indicators = _fetch_15m_indicators(execution_timestamp)
 
     current_spot_close = technical_indicators["current_price"]
     context = {
+        "execution_timestamp": execution_timestamp.isoformat(),
+        "source_candle_timestamp": technical_indicators.get(
+            "source_candle_timestamp", execution_timestamp.isoformat()
+        ),
         "spot": {
             "symbol": "BTC-USD",
             "current_close": current_spot_close,

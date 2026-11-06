@@ -23,9 +23,10 @@ You have two inputs:
 1. A visual chart displaying price action and OHLCV-based Volume Profile levels (Yellow = Point of Control, Cyan = Value Area High/Low).
 2. A JSON payload using the current_price, technical_indicators, and institutional_order_flow schema.
 3. Supporting market details containing completed-candle context, volume profile, macro data, and derivative measurements.
-4. The four-hour trading playbook. Apply its rules, thresholds, evidence requirements, and risk/reward test.
+4. The master playbook. Apply its global rules and only the four-hour horizon rules; ignore 2H-only rules.
 YOUR CONFLUENCE RUBRIC:
 - Treat the advisory as a directional forecast, not an instruction to buy or sell and not an automatic trading system.
+- The binary forecast outcome is determined only by whether the BTC 1-minute Binance close at the exact 4-hour expiration is above or below `btc_price_at_prediction`. Targets, ranges, and intraperiod high/low touches do not determine win or loss.
 - The direction MUST be exactly UP or DOWN. When evidence is unclear or contradictory, choose the best-supported direction, normally use confidence 4/10 or lower when no meaningful edge exists, and explicitly state that this is not an actionable setup.
 - Use only completed four-hour candles; a wick alone does not confirm breakout, reclaim, or rejection.
 - Apply the supplied macro, volume, funding, open-interest, setup, and reward/risk rules. Do not infer open-interest change from a single snapshot or fabricate unavailable data.
@@ -55,7 +56,7 @@ STRATEGIST_SYSTEM_PROMPT = """You are the Autonomous Playbook Auditor for a BTC-
 We evaluate trades strictly on whether the expiration close is above or below `btc_price_at_prediction` (starting price), NOT on high/low price ranges.
 
 STRICT RULES FOR UPDATING THE PLAYBOOK:
-1. HORIZON ISOLATION: Check `forecast_horizon_hours` in the failed trade JSON. If it is "2", ONLY update `## 2. 2-Hour (2H) Horizon Rules` or `## 4. Invalidated Setups`. If it is "4", ONLY update `## 3. 4-Hour (4H) Horizon Rules` or `## 4. Invalidated Setups`.
+1. HORIZON ISOLATION: Check `forecast_horizon_hours` in the failed trade JSON. If it is "2", ONLY update `## 2. 2-Hour (2H) Horizon Rules`. If it is "4", ONLY update `## 3. 4-Hour (4H) Horizon Rules`. Do not change global rules or any other section.
 2. VERIFIABLE METRICS ONLY: Base rule adjustments strictly on `btc_price_at_prediction`, Volume Profile (`poc_price`, `value_area_high`, `value_area_low`), candle structure, and volume.
 3. NO CONTRADICTIONS: Merge new conditions into existing rules using `IF / UNLESS` logic rather than piling up conflicting bullets.
 4. OUTPUT: Return ONLY the complete, updated Markdown text starting with `# BTC-USD Autonomous Forecasting Playbook`."""
@@ -84,8 +85,61 @@ def load_playbook() -> str:
     return playbook
 
 
+def _replace_horizon_section(
+    original: str,
+    generated: str,
+    horizon_hours: int,
+) -> str | None:
+    section_heading = (
+        "## 2. 2-Hour (2H) Horizon Rules"
+        if horizon_hours == 2
+        else "## 3. 4-Hour (4H) Horizon Rules"
+    )
+    section_pattern = re.compile(
+        rf"(?ms)^{re.escape(section_heading)}\s*\n.*?(?=^## |\Z)"
+    )
+    original_match = section_pattern.search(original)
+    generated_match = section_pattern.search(generated)
+    if not original_match or not generated_match:
+        return None
+    replacement = generated_match.group(0).rstrip() + "\n\n"
+    return (
+        original[: original_match.start()]
+        + replacement
+        + original[original_match.end() :].lstrip("\n")
+    )
+
+
 async def evolve_playbook_from_losses() -> list[Path]:
     """Find LOST memory files in the vault and evolve the active master playbook."""
+    failed_memories: list[tuple[Path, str, dict[str, Any]]] = []
+    for md_file in sorted(MEMORIES_DIR.glob("*.md")):
+        content = md_file.read_text(encoding="utf-8")
+        match = re.search(r"```json\s*(\{.*?\})\s*```", content, flags=re.DOTALL)
+        if not match:
+            continue
+
+        try:
+            context_data = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+
+        if context_data.get("evaluation_status") not in {"LOSS", "LOST"} and not (
+            "LOSS:" in content or "LOST:" in content
+        ):
+            continue
+        if context_data.get("audited") is True:
+            continue
+        try:
+            horizon_hours = int(context_data.get("forecast_horizon_hours"))
+        except (TypeError, ValueError):
+            continue
+        if horizon_hours not in (2, 4):
+            continue
+        failed_memories.append((md_file, content, context_data))
+
+    if not failed_memories:
+        return []
     if AsyncOpenAI is None:
         raise ImportError("The openai package is required to evolve the playbook from DeepSeek losses.")
 
@@ -96,29 +150,17 @@ async def evolve_playbook_from_losses() -> list[Path]:
         base_url="https://api.deepseek.com/v1",
     )
 
-    for md_file in sorted(MEMORIES_DIR.glob("*.md")):
-        content = md_file.read_text(encoding="utf-8")
-        if "LOST:" not in content:
-            continue
-
-        match = re.search(r"```json\s*(\{.*?\})\s*```", content, flags=re.DOTALL)
-        if not match:
-            continue
-
-        try:
-            context_data = json.loads(match.group(1))
-        except json.JSONDecodeError:
-            continue
-
-        if context_data.get("audited") is True:
-            continue
-
+    for md_file, content, context_data in failed_memories:
+        horizon_hours = int(context_data["forecast_horizon_hours"])
         print(f"[PRO STRATEGIST] Auditing failed memory: {md_file.name}...")
 
         user_prompt = (
             f"### CURRENT PLAYBOOK (`01_Playbooks/master_playbook.md`):\n{current_playbook}\n\n"
             f"### FAILED TRADE MEMORY (`02_Trade_Memories/{md_file.name}`):\n{content}\n\n"
-            "Identify why the forecast direction failed relative to `btc_price_at_prediction` and output the updated Playbook."
+            f"The failed forecast horizon is {horizon_hours} hours. "
+            f"Only update the {horizon_hours}H horizon rules section; preserve every "
+            "other section exactly. Identify why the forecast direction failed "
+            "relative to `btc_price_at_prediction` and return the complete playbook."
         )
 
         response = await client.chat.completions.create(
@@ -134,10 +176,15 @@ async def evolve_playbook_from_losses() -> list[Path]:
         if updated_playbook.startswith("```"):
             updated_playbook = "\n".join(updated_playbook.splitlines()[1:-1]).strip()
 
-        if "# BTC-USD Autonomous Forecasting Playbook" in updated_playbook and len(updated_playbook) > 150:
+        isolated_playbook = _replace_horizon_section(
+            current_playbook,
+            updated_playbook,
+            horizon_hours,
+        )
+        if isolated_playbook and "# BTC-USD Autonomous Forecasting Playbook" in updated_playbook:
             shutil.copyfile(MASTER_PLAYBOOK_FILE, PLAYBOOK_BACKUP_FILE)
-            MASTER_PLAYBOOK_FILE.write_text(updated_playbook, encoding="utf-8")
-            current_playbook = updated_playbook
+            MASTER_PLAYBOOK_FILE.write_text(isolated_playbook, encoding="utf-8")
+            current_playbook = isolated_playbook
 
             context_data["audited"] = True
             updated_content = re.sub(
@@ -427,7 +474,10 @@ def generate_trading_advisory(
             },
             sort_keys=True,
         )
-    past_lessons = retrieve_past_lessons(regime_context)
+    past_lessons = retrieve_past_lessons(
+        regime_context,
+        forecast_horizon_hours=4,
+    )
     client = gemini_utils.create_client()
 
     with Image.open(image_path) as chart_image:

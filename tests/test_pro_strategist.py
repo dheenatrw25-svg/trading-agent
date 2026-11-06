@@ -95,7 +95,7 @@ class PlaybookTests(unittest.TestCase):
         )
         self.assertIn("LESSON TEXT", contents[4])
         self.assertIsInstance(contents[5], Image.Image)
-        self.assertEqual(request["model"], "gemini-3.0-flash")
+        self.assertEqual(request["model"], "gemini-3-flash-preview")
         self.assertNotIn(
             "temperature",
             request["config"].model_dump(exclude_none=True),
@@ -567,17 +567,57 @@ class MarketContextTests(unittest.TestCase):
             },
             index=timestamps,
         )
+        execution_timestamp = now
         with patch.object(data_engine.yf, "download", return_value=candles) as download:
-            indicators = data_engine._fetch_15m_indicators()
+            indicators = data_engine._fetch_15m_indicators(execution_timestamp)
 
-        download.assert_called_once_with(
-            "BTC-USD",
-            period="5d",
-            interval="15m",
-            progress=False,
+        self.assertEqual(download.call_count, 1)
+        self.assertEqual(download.call_args.args, ("BTC-USD",))
+        self.assertEqual(
+            download.call_args.kwargs,
+            {
+                "start": (execution_timestamp - pd.Timedelta(days=5)).to_pydatetime(),
+                "end": execution_timestamp.to_pydatetime(),
+                "interval": "15m",
+                "progress": False,
+            },
         )
         self.assertEqual(indicators["current_price"], close[-1])
         self.assertEqual(indicators["rsi_15m"], 100.0)
+        self.assertEqual(
+            pd.Timestamp(indicators["source_candle_timestamp"]),
+            timestamps[-1] + pd.Timedelta(minutes=15),
+        )
+
+    def test_execution_timestamp_is_shared_by_4h_and_15m_downloads(self) -> None:
+        execution_timestamp = pd.Timestamp("2026-01-01T12:00:00Z")
+        candle_index = pd.date_range(
+            end=execution_timestamp - pd.Timedelta(hours=4),
+            periods=3,
+            freq="4h",
+        )
+        candles = pd.DataFrame(
+            {
+                "Open": [100.0] * 3,
+                "High": [101.0] * 3,
+                "Low": [99.0] * 3,
+                "Close": [100.0] * 3,
+                "Volume": [1.0] * 3,
+            },
+            index=candle_index,
+        )
+        with patch.object(data_engine.yf, "download", return_value=candles) as download:
+            spot_data = data_engine.fetch_spot_data(execution_timestamp)
+
+        self.assertEqual(spot_data.attrs["execution_timestamp"], execution_timestamp.isoformat())
+        self.assertEqual(
+            download.call_args.kwargs["end"],
+            execution_timestamp.to_pydatetime(),
+        )
+        self.assertEqual(
+            download.call_args.kwargs["start"],
+            (execution_timestamp - pd.Timedelta(days=15)).to_pydatetime(),
+        )
 
     def test_order_book_walls_use_depth_1000_and_report_largest_bins(self) -> None:
         response = Mock()

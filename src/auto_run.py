@@ -7,7 +7,6 @@ import schedule
 from . import (
     chart_engine,
     data_engine,
-    evaluator,
     market_predictor,
     polymarket_paper,
     pro_strategist,
@@ -17,6 +16,7 @@ from .prediction_logs import (
     ADVISORY_LOG_FILE,
     append_record,
     append_forecast_result,
+    forecast_expiration_timestamp,
     initialize_advisory_log,
     to_utc_iso,
     utc_now,
@@ -40,12 +40,20 @@ def _validate_advisory(advisory: object) -> bool:
         return False
 
 
-def run_agent_pipeline() -> None:
-    timestamp = datetime.datetime.now().isoformat(timespec="seconds")
-    print(f"\n[{timestamp}] Gatekeeper triggered.")
+def _evaluate_and_evolve_before_forecast() -> None:
+    from .trading_agent import evaluate_and_evolve_expired_forecasts
+
+    evaluate_and_evolve_expired_forecasts()
+
+
+def run_agent_pipeline(*, reviewed: bool = False) -> None:
+    print("\nGatekeeper triggered.")
 
     try:
-        spot_data = data_engine.fetch_spot_data()
+        if not reviewed:
+            _evaluate_and_evolve_before_forecast()
+        execution_timestamp = utc_now()
+        spot_data = data_engine.fetch_spot_data(execution_timestamp)
         market_context = data_engine.compile_market_context(spot_data=spot_data)
         btc_price = market_context["spot"]["current_close"]
 
@@ -61,20 +69,33 @@ def run_agent_pipeline() -> None:
             return
 
         initialize_csv()
-        issue_time = utc_now()
+        issue_time = datetime.datetime.fromisoformat(
+            str(
+                market_context.get(
+                    "execution_timestamp", execution_timestamp.isoformat()
+                )
+            ).replace("Z", "+00:00")
+        )
+        print(f"[GATEKEEPER] execution_timestamp={to_utc_iso(issue_time)}.")
         issue_timestamp = to_utc_iso(issue_time)
-        source_timestamp = spot_data.index[-1]
+        source_timestamp = datetime.datetime.fromisoformat(
+            str(
+                market_context.get(
+                    "source_candle_timestamp", spot_data.index[-1].isoformat()
+                )
+            ).replace("Z", "+00:00")
+        )
         if source_timestamp.tzinfo is None:
             raise ValueError("Source candle timestamp must include a timezone.")
-        source_timestamp = source_timestamp.tz_convert("UTC")
+        source_timestamp = source_timestamp.astimezone(datetime.timezone.utc)
         if source_timestamp > issue_time:
             raise ValueError("Source candle timestamp is later than the forecast issue time.")
         row = {
             "timestamp": issue_timestamp,
             "forecast_issue_timestamp": issue_timestamp,
-            "source_candle_timestamp": source_timestamp.isoformat(),
+            "source_candle_timestamp": to_utc_iso(source_timestamp),
             "target_timestamp": to_utc_iso(
-                issue_time + datetime.timedelta(hours=FORECAST_HORIZON_HOURS)
+                forecast_expiration_timestamp(issue_time, FORECAST_HORIZON_HOURS)
             ),
             "forecast_horizon_hours": FORECAST_HORIZON_HOURS,
             "btc_price_at_prediction": btc_price,
@@ -118,6 +139,11 @@ def run_market_prediction() -> None:
         f"{datetime.datetime.now().strftime('%H:%M:%S')} ---"
     )
     try:
+        _evaluate_and_evolve_before_forecast()
+    except Exception as exc:
+        print(f"Error during expired-forecast evaluation/evolution: {exc}")
+        return
+    try:
         forecast = market_predictor.run_predictor("BTC-USD")
         if forecast:
             try:
@@ -127,25 +153,6 @@ def run_market_prediction() -> None:
                 print(f"[POLYMARKET PAPER] 2H forecast processing failed: {exc}")
     except Exception as exc:
         print(f"Error during prediction: {exc}")
-    results = []
-    for label, grade in (
-        ("2-hour forecasts", evaluator.grade_pending_predictions),
-        ("4-hour advisories", evaluator.grade_pending_advisories),
-    ):
-        try:
-            results.append(grade())
-        except Exception as exc:
-            print(f"Error during {label} evaluation: {exc}")
-    if results:
-        print(
-            "[EVALUATOR] "
-            f"{sum(result['graded'] for result in results)} evaluated, "
-            f"{sum(result['pending'] for result in results)} pending, "
-            f"{sum(result['needs_review'] for result in results)} need review, "
-            f"{sum(result['errors'] for result in results)} errors."
-        )
-
-
 def settle_polymarket_positions() -> None:
     try:
         result = polymarket_paper.settle_open_positions()

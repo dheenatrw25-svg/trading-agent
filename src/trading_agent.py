@@ -35,7 +35,7 @@ from PIL import Image
 # ---------------------------------------------------------------------------
 from .paths import ASSETS_DIR, LOGS_DIR
 from . import gemini_utils, market_predictor
-from .prediction_logs import evaluate_pending_memories
+from . import evaluator
 from .pro_strategist import evolve_playbook_from_losses
 
 STATE_PATH = LOGS_DIR / "agent_state.json"
@@ -733,6 +733,38 @@ def filter_and_execute(
     return state
 
 
+def evaluate_and_evolve_expired_forecasts() -> tuple[dict[str, Any], list[Path]]:
+    """Grade both horizons and evolve only rules for newly recorded losses."""
+    evaluations = {
+        "2-hour forecasts": evaluator.grade_pending_predictions(),
+        "4-hour advisories": evaluator.grade_pending_advisories(),
+    }
+    print(
+        "[RUN] Expiry grading complete: "
+        + ", ".join(
+            f"{name}={result['graded']} graded/{result['lost']} losses"
+            for name, result in evaluations.items()
+        )
+    )
+
+    evolved = asyncio.run(evolve_playbook_from_losses())
+    if evolved:
+        print(f"[RUN] Evolved the horizon-specific playbook from {len(evolved)} loss(es).")
+    else:
+        print("[RUN] No unevolved binary losses found.")
+    return evaluations, evolved
+
+
+def run_forecast_cycle() -> dict[str, Any]:
+    """Grade expired forecasts, evolve isolated horizon rules, then issue forecasts."""
+    evaluations, evolved = evaluate_and_evolve_expired_forecasts()
+    from . import auto_run
+
+    auto_run.run_agent_pipeline(reviewed=True)
+    forecast = market_predictor.run_predictor("BTC-USD")
+    return {"evaluations": evaluations, "forecast": forecast, "evolved_memories": evolved}
+
+
 # ---------------------------------------------------------------------------
 # 6. Orchestration
 # ---------------------------------------------------------------------------
@@ -744,6 +776,9 @@ def run_agent(ticker: str) -> dict[str, Any]:
     print("=" * 72)
     print(f"[RUN] Phase 1 paper agent  |  {ticker}  |  {_iso(_now_utc())}")
     print("=" * 72)
+
+    # Keep evaluation and playbook evolution ahead of every new forecast.
+    run_forecast_cycle()
 
     ensure_trades_csv()
     state = rollover_daily_pnl(load_state())
@@ -760,18 +795,6 @@ def run_agent(ticker: str) -> dict[str, Any]:
         f"Daily PnL ${float(state['daily_realized_pnl']):,.2f}  |  "
         f"Consecutive losses {state.get('consecutive_losses', 0)}"
     )
-
-    # 1) Grade expired memory files before any fresh forecast cycle.
-    lost_files = evaluate_pending_memories()
-    if lost_files:
-        print(f"[RUN] Found {len(lost_files)} expired LOST memory files; evolving playbook before forecast.")
-        asyncio.run(evolve_playbook_from_losses())
-    else:
-        print("[RUN] No expired LOST memory files detected.")
-
-    # 2) Re-run the 2H/4H forecast cycle with the updated vault playbook.
-    print("[RUN] Launching BTC 2H/4H forecast cycle with the updated playbook.")
-    market_predictor.run_predictor("BTC-USD")
 
     # Need extra 15m/60m history so EMA50 / RSI / ATR are fully warmed up
     # before we slice the visible window.

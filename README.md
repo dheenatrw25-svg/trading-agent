@@ -19,6 +19,12 @@ and open-interest trend). The application retains the detailed market context
 internally for risk checks and prediction logging.
 
 - The 2-hour BTC predictor writes only to `logs/btc_forecasts_2h.csv`.
+- The 2-hour forecast baseline uses Binance BTCUSDT live spot pricing; responses
+  without an HTTP `Date` header within five seconds are rejected.
+- Four-hour market-context downloads use one UTC `execution_timestamp` for both
+  4-hour and 15-minute candle cutoffs. Advisory logs retain that execution time
+  and the completed 15-minute candle close time, rather than pairing a 15-minute
+  price with a 4-hour candle's opening time.
 - Dashboard and scheduled advisory predictions write only to `logs/advisory_log.csv`.
 - Both forecast pipelines also append a display-ready record to
   `logs/forecast_results.csv`. This unified file uses the same nine columns for
@@ -34,16 +40,16 @@ internally for risk checks and prediction logging.
   its backup, rather than misclassified as dashboard predictions.
 - Pending BTC forecasts and four-hour advisories are evaluated after their expiry.
   Evaluation outcomes and full forecast context are saved to dated Markdown files
-  under `vault/02_Trade_Memories/`, which are read to provide past lessons to the
-  four-hour engine. The two-hour evaluator records direction correctness,
-  final-close range coverage, full-period range coverage, and projected-price
-  errors as separate measurements. For `SIDEWAYS`, range coverage determines the
-  outcome.
-- Evaluation prefers a 15-minute close at the exact expiry boundary. When expiry
-  falls between 15-minute closes, it uses the latest completed 1-minute close no
-  more than one minute before expiry. Range measurements use complete OHLC candle
-  bars overlapping the evaluated interval, and the actual close timestamp is
-  recorded so the candle resolution is visible.
+  under `vault/02_Trade_Memories/`. Both horizons are graded strictly as `WIN` or
+  `LOSS` by comparing the prediction-time BTC price with the historical Binance
+  1-minute close at expiration; an unchanged close is a loss. Intraperiod highs,
+  lows, targets, and ranges do not affect grading. Expiration timestamps are
+  rounded up to the next full minute so an exact 1-minute candle close exists.
+- The scheduled forecast cycle grades expired 2-hour and 4-hour forecasts, evolves
+  the master playbook from unaudited losses, and only then generates new forecasts.
+  Playbook lessons and updates are isolated by forecast horizon: 2-hour forecasts
+  receive only 2-hour memories/rules, and 4-hour forecasts receive only 4-hour
+  memories/rules.
 - Order-book walls are aggregated in $10 price bins from Binance's 1,000-level
   depth snapshot. The evaluator reports the observed snapshot span because the
   endpoint may return fewer levels than needed to cover the full $2,000 search

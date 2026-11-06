@@ -1,5 +1,6 @@
 import json
 import datetime
+import email.utils
 import math
 import tempfile
 import uuid
@@ -7,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 import mplfinance as mpf
 from PIL import Image
@@ -18,6 +20,7 @@ from .prediction_logs import (
     BTC_FORECAST_FILE,
     append_record,
     append_forecast_result,
+    forecast_expiration_timestamp,
     initialize_btc_forecast_log,
     to_utc_iso,
     utc_now,
@@ -26,9 +29,11 @@ from .prediction_logs import (
 LOG_FILE = BTC_FORECAST_FILE
 FORECAST_HORIZON_HOURS = 2
 MARKET_DATA_TIMEOUT_SECONDS = 15
+BINANCE_SPOT_URL = "https://api.binance.com/api/v3/ticker/price"
+BINANCE_PRICE_MAX_AGE_SECONDS = 5
 MAX_EXPECTED_RANGE_WIDTH = 450.0
 MAX_DIRECTIONAL_ANCHOR_BUFFER = 50.0
-ALLOWED_DIRECTIONS = {"BULLISH", "BEARISH", "SIDEWAYS"}
+ALLOWED_DIRECTIONS = {"BULLISH", "BEARISH"}
 REQUIRED_PREDICTION_FIELDS = {
     "predicted_direction",
     "confidence_score",
@@ -37,6 +42,54 @@ REQUIRED_PREDICTION_FIELDS = {
     "projected_price_in_2h",
     "predicted_scenario",
 }
+
+
+def fetch_binance_spot_price() -> tuple[float, datetime.datetime]:
+    """Fetch BTC spot price and verify the Binance response is fresh."""
+    try:
+        response = requests.get(
+            BINANCE_SPOT_URL,
+            params={"symbol": "BTCUSDT"},
+            timeout=MARKET_DATA_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Binance spot-price request failed: {exc}") from exc
+    except ValueError as exc:
+        raise RuntimeError("Binance returned invalid spot-price JSON.") from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("Binance spot-price response has an invalid shape.")
+    try:
+        price = float(payload["price"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("Binance spot-price response is missing a valid price.") from exc
+    if not math.isfinite(price) or price <= 0:
+        raise RuntimeError("Binance returned a non-positive or non-finite spot price.")
+
+    response_date = response.headers.get("Date")
+    if not response_date:
+        raise RuntimeError(
+            "Binance spot-price response has no Date header; freshness cannot be verified."
+        )
+    try:
+        quoted_at = email.utils.parsedate_to_datetime(response_date)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Binance spot-price response has an invalid Date header.") from exc
+    if quoted_at.tzinfo is None:
+        quoted_at = quoted_at.replace(tzinfo=datetime.timezone.utc)
+    quoted_at = quoted_at.astimezone(datetime.timezone.utc)
+
+    age_seconds = (
+        datetime.datetime.now(datetime.timezone.utc) - quoted_at
+    ).total_seconds()
+    if age_seconds < -1 or age_seconds > BINANCE_PRICE_MAX_AGE_SECONDS:
+        raise RuntimeError(
+            "Binance spot-price response is stale or future-dated "
+            f"(server Date age {age_seconds:.1f}s)."
+        )
+    return price, quoted_at
 
 
 def clamp_prediction_range(
@@ -295,9 +348,18 @@ def predict_next_2_hours(image_path: str, metrics: dict, ticker: str) -> dict:
     client = gemini_utils.create_client()
     chart_image = Image.open(image_path)
 
+    from .evaluator import retrieve_past_lessons
+    from .pro_strategist import load_playbook
+
+    playbook = load_playbook()
+    regime = str(metrics.get("macro_trend", "BTC market"))
+    past_lessons = retrieve_past_lessons(regime, forecast_horizon_hours=2)
     system_prompt = """
     You are an expert market analyst specializing in short-term price action forecasting.
-    Do NOT recommend buying or selling. Your only job is to predict what the price will do over the NEXT 2 HOURS (the next 8 fifteen-minute candles).
+    Do NOT recommend buying or selling. Make a binary directional forecast for BTC at
+    the exact 2-hour expiration: BULLISH means the expiration close will be above the
+    price at prediction; BEARISH means it will be below. Do not use intraperiod highs,
+    lows, or target touches to determine the outcome.
 
     Analyze:
     1. Top Chart (1H Macro Trend) vs Bottom Chart (15m Micro Structure).
@@ -312,13 +374,14 @@ def predict_next_2_hours(image_path: str, metrics: dict, ticker: str) -> dict:
     - For BULLISH forecasts, anchor the range low at or below current_price,
       but no more than $50 below it. Extend the rest of the range upward
       toward projected_price_in_2h; the range must not straddle current_price.
-    - For SIDEWAYS forecasts or action WAIT, center the range evenly around
-      current_price.
+    Use the 2-hour-specific rules from the master playbook, in addition to its global
+    rules. Ignore all 4-hour-specific rules. Historical 2-hour lessons are binding:
+    do not repeat a failed setup pattern without addressing the recorded failure.
     These are hard constraints; do not return a wider or oppositely anchored range.
 
     Respond ONLY in valid JSON matching this exact structure:
     {
-        "predicted_direction": "BULLISH" | "BEARISH" | "SIDEWAYS",
+        "predicted_direction": "BULLISH" | "BEARISH",
         "confidence_score": 1-10,
         "expected_high_next_2h": float,
         "expected_low_next_2h": float,
@@ -330,13 +393,20 @@ def predict_next_2_hours(image_path: str, metrics: dict, ticker: str) -> dict:
     user_prompt = f"""
     Asset: {ticker}
     Exact Market Metrics: {json.dumps(metrics, indent=2)}
-    Examine the dual chart image and metrics. Forecast the next 2 hours of price action.
+    Examine the dual chart image and metrics. Follow the master playbook and its
+    2-hour lessons. Forecast whether the BTC close at the exact expiration timestamp
+    will be above or below the prediction-time price.
     """
 
     response = gemini_utils.generate_content_with_retry(
         client,
         model=gemini_utils.GEMINI_MODEL,
-        contents=[chart_image, user_prompt],
+        contents=[
+            f"2-hour master playbook:\n{playbook}",
+            f"Relevant 2-hour historical lessons:\n{past_lessons}",
+            chart_image,
+            user_prompt,
+        ],
         config=types.GenerateContentConfig(
             system_instruction=system_prompt,
             response_mime_type="application/json",
@@ -370,7 +440,7 @@ def log_prediction(
     source_timestamp = source_timestamp.tz_convert("UTC")
     if source_timestamp > pd.Timestamp(issue_time):
         raise ValueError("Source candle timestamp is later than the forecast issue time.")
-    starting_price = metrics["current_price"]
+    starting_price = metrics.get("btc_price_at_prediction", metrics["current_price"])
     if (
         isinstance(starting_price, bool)
         or not isinstance(starting_price, (int, float))
@@ -381,8 +451,8 @@ def log_prediction(
     if not isinstance(ticker, str) or ticker.strip().upper() != "BTC-USD":
         raise ValueError("The 2-hour forecast log accepts only the BTC-USD ticker.")
 
-    target_time = issue_time.astimezone(datetime.timezone.utc) + datetime.timedelta(
-        hours=FORECAST_HORIZON_HOURS
+    target_time = forecast_expiration_timestamp(
+        issue_time, FORECAST_HORIZON_HOURS
     )
     record = {
         "forecast_id": str(uuid.uuid4()),
@@ -426,6 +496,10 @@ def run_predictor(ticker: str = "BTC-USD") -> dict:
 
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 2. Calculating market metrics...")
     metrics = calculate_metrics(df_micro, df_macro)
+    live_price, execution_timestamp = fetch_binance_spot_price()
+    metrics["current_price"] = live_price
+    metrics["btc_price_at_prediction"] = live_price
+    metrics["execution_timestamp"] = execution_timestamp.isoformat()
 
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 3. Asking Gemini for 2-hour prediction...")
     prediction = predict_next_2_hours(chart_path, metrics, ticker)
@@ -440,7 +514,12 @@ def run_predictor(ticker: str = "BTC-USD") -> dict:
     print(f"Scenario:            {prediction['predicted_scenario']}")
     print("========================================================\n")
 
-    record = log_prediction(ticker, metrics, prediction)
+    record = log_prediction(
+        ticker,
+        metrics,
+        prediction,
+        issued_at=execution_timestamp,
+    )
     print(f"Saved forecast to {LOG_FILE}")
     return record
 

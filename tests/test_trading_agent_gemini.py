@@ -37,7 +37,7 @@ class TradingAgentGeminiTests(unittest.TestCase):
                 )
 
         self.assertEqual(result, decision)
-        self.assertEqual(request.call_args.kwargs["model"], "gemini-3.0-flash")
+        self.assertEqual(request.call_args.kwargs["model"], "gemini-3-flash-preview")
         self.assertNotIn(
             "temperature",
             request.call_args.kwargs["config"].model_dump(exclude_none=True),

@@ -47,10 +47,15 @@ class DashboardForecastRouteTests(unittest.TestCase):
         forecast_row = process_forecast.call_args.args[0]
         self.assertEqual(forecast_row["direction"], "UP")
         self.assertEqual(forecast_row["forecast_horizon_hours"], 4)
-        self.assertEqual(
+        forecast_duration = (
             pd.Timestamp(forecast_row["target_timestamp"])
-            - pd.Timestamp(forecast_row["forecast_issue_timestamp"]),
-            pd.Timedelta(hours=4),
+            - pd.Timestamp(forecast_row["forecast_issue_timestamp"])
+        )
+        self.assertGreaterEqual(forecast_duration, pd.Timedelta(hours=4))
+        self.assertLess(forecast_duration, pd.Timedelta(hours=4, minutes=1))
+        self.assertEqual(
+            pd.Timestamp(forecast_row["target_timestamp"]).second,
+            0,
         )
         process_forecast.assert_called_once_with(forecast_row, "advisory")
         self.assertEqual(result["polymarket_paper"], paper_status)
